@@ -128,11 +128,23 @@ cd bindings/node && napi build --platform --release
 cd bindings/node && node -e "const m=require('.'); m.FlowDb.open({dataDir:'/tmp/t',createIfMissing:true}).close()"
 ```
 
-### Cross-platform publishing
+### Cross-platform publishing (local, no GitHub CI)
+
+All 5 targets are built locally — Mac mini handles the two darwin targets,
+a Linux x86_64 machine handles linux-gnu ×2 and windows-msvc via SSH.
 
 ```bash
-napi artifacts                    # generate npm platform packages
-npm publish                      # publish all packages
+# 1. Mac mini: build darwin-arm64 + darwin-x64
+cd bindings/node && ./scripts/build-all.sh
+
+# 2. Linux SSH: build linux-x64 + linux-arm64 + windows-msvc
+LINUX_SSH=user@linux-host ./scripts/remote-build.sh
+
+# 3. Generate platform subpackages
+node scripts/publish-platforms.js
+
+# 4. Publish main package + 5 platform subpackages
+npm publish && for p in npm/*/; do (cd "$p" && npm publish); done
 ```
 
 The TypeScript wrapper in `ts/` is compiled with `tsc` to `dist/`. The `index.js` loader handles platform detection.

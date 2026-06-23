@@ -612,6 +612,77 @@ mod tests {
         assert_eq!(size, 8 + 1 + 2 + 5 + 8 + 8 + 4 + 4 + 3 + CHECKSUM_LEN);
     }
 
+    /// Regression test for PR #1: `write_encoded`'s lazy-init path must
+    /// increment `next_segment_id`, otherwise the following rollover would
+    /// reuse the same id and collide with the existing segment file
+    /// (`create_new_segment` silently appends to an existing file).
+    #[test]
+    fn test_write_encoded_lazy_init_increments_segment_id() {
+        let dir = TempDir::new().unwrap();
+        let mut wal = Wal::open(dir.path(), 1).unwrap();
+
+        // Simulate the "no active segment" state that `write_encoded`'s
+        // lazy-init branch is designed to handle. We do this by dropping
+        // the in-memory segments while keeping next_segment_id ahead of
+        // anything already on disk.
+        wal.segments.clear();
+        wal.next_segment_id = 42;
+
+        let rec = make_record("lazy", 1, 1);
+        let (buf, _) = encode_batch(&[rec]);
+        wal.write_encoded(&buf, 1).unwrap();
+
+        // The lazy-init call must have consumed id 42 and bumped to 43.
+        assert_eq!(wal.next_segment_id, 43);
+        assert_eq!(wal.segments.len(), 1);
+        assert!(
+            wal.segments[0]
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap()
+                .starts_with("000000042"),
+            "lazy-init should create segment 42, got {:?}",
+            wal.segments[0].path.file_name()
+        );
+
+        // Now force a rollover. It must use id 43, NOT reuse 42 — that
+        // was the original bug (file-name collision → silent append).
+        let big = InternalRecord::from_record(
+            &Record {
+                key: b"big".to_vec(),
+                ts: 2,
+                expire_at: i64::MAX,
+                value: vec![0u8; 1_100_000],
+            },
+            2,
+        );
+        let (buf2, _) = encode_batch(&[big]);
+        wal.write_encoded(&buf2, 2).unwrap();
+
+        assert_eq!(wal.segments.len(), 2, "rollover should create a 2nd segment");
+        let seg2_name = wal.segments[1]
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap();
+        assert!(
+            seg2_name.starts_with("000000043"),
+            "rollover should create segment 43, got {seg2_name}"
+        );
+        assert_ne!(
+            wal.segments[0].path, wal.segments[1].path,
+            "segments must be distinct files"
+        );
+
+        // Both records must survive replay (proves the rollover segment
+        // was actually a fresh file, not an append to segment 42).
+        let recs = wal.replay_from(0).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].key, b"lazy".as_slice());
+        assert_eq!(recs[1].key, b"big".as_slice());
+    }
+
     #[test]
     fn test_wal_segment_rollover() {
         let dir = TempDir::new().unwrap();

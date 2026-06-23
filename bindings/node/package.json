@@ -23,8 +23,8 @@
     "build": "napi build --platform --release && npx tsc",
     "build:debug": "napi build --platform && npx tsc",
     "artifacts": "napi artifacts",
-    "prepublishOnly": "npm run build && node scripts/publish-platforms.js",
-    "test": "node -e \"const m = require('./index.js'); const db = m.FlowDB.open({dataDir:'/tmp/test',createIfMissing:true}); db.close(); console.log('ok')\""
+    "prepublishOnly": "node scripts/publish-platforms.js",
+    "test": "node -e \"const m = require('./index.js'); const db = m.FlowDb.open({dataDir:'/tmp/test',createIfMissing:true}); db.close(); console.log('ok')\""
   },
   "optionalDependencies": {
     "flowdb-darwin-arm64": "0.7.3",

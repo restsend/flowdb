@@ -8,7 +8,7 @@ bindings/node/*.node
 # Node.js dependencies
 bindings/node/node_modules/
 
-# npm package artifacts
+# npm package artifacts (built locally, never committed)
 bindings/node/dist/
 bindings/node/npm/
-bindings/node/artifacts/index.d.ts
+bindings/node/artifacts/

@@ -20,7 +20,7 @@ function loadNative() {
     )
   }
 
-  // 1. Try platform-specific package (published separately by CI)
+  // 1. Try platform-specific package (published separately)
   try {
     return require(`flowdb-${suffix}`)
   } catch (_) {

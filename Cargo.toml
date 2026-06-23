@@ -3,7 +3,7 @@ members = ["flowdb-derive", "bindings/node"]
 
 [package]
 name = "flowdb"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/flowdb"
@@ -35,7 +35,7 @@ tracing-subscriber = "0.3"
 lru = "0.18"
 ahash = "0.8"
 lz4_flex = "0.13.1"
-flowdb-derive = { version = "0.7.2", path = "flowdb-derive" }
+flowdb-derive = { version = "0.7.3", path = "flowdb-derive" }
 
 [dev-dependencies]
 tempfile = "3"
