@@ -218,7 +218,9 @@ impl Wal {
 
     pub fn write_encoded(&mut self, buf: &[u8], batch_max_seq: u64) -> Result<()> {
         if self.segments.is_empty() {
-            self.create_new_segment(self.next_segment_id)?;
+            let id = self.next_segment_id;
+            self.next_segment_id += 1;
+            self.create_new_segment(id)?;
         }
 
         let seg = self
