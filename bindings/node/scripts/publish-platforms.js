@@ -63,7 +63,7 @@ function main() {
 
     // Generate package.json
     const platformPkg = {
-      name: `flowdb-${suffix}`,
+      name: `@restsend/flowdb-${suffix}`,
       version: VERSION,
       ...plat,
       main: file,

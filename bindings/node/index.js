@@ -22,7 +22,7 @@ function loadNative() {
 
   // 1. Try platform-specific package (published separately)
   try {
-    return require(`flowdb-${suffix}`)
+    return require(`@restsend/flowdb-${suffix}`)
   } catch (_) {
     // not installed — fall through
   }
