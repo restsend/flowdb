@@ -65,11 +65,11 @@ db.apply_schema::<User>()?;
 ## Node.js (npm)
 
 ```bash
-npm install flowdb
+npm install @restsend/flowdb
 ```
 
 ```js
-const { FlowDB } = require('flowdb')
+const { FlowDB } = require('@restsend/flowdb')
 
 const db = FlowDB.open({ dataDir: './data' })
 await db.createObjectStore('users', 'id')

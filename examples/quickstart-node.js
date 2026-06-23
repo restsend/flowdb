@@ -5,7 +5,7 @@
 //   cd bindings/node && npm install && npx napi build --platform --release
 //
 // Or if flowdb is installed from npm:
-//   npm install flowdb
+//   npm install @restsend/flowdb
 
 const { FlowDB } = require('../bindings/node')
 

@@ -6,14 +6,14 @@
 
 ### Objective
 
-Use FlowDB from Node.js with `npm install flowdb` — zero Rust toolchain required.
+Use FlowDB from Node.js with `npm install @restsend/flowdb` — zero Rust toolchain required.
 FlowDB provides an IndexedDB-like document database with ACID transactions,
 secondary indexes, and unique constraints.
 
 ### Prerequisites
 
 ```bash
-npm install flowdb
+npm install @restsend/flowdb
 ```
 
 ### Step-by-Step
@@ -21,7 +21,7 @@ npm install flowdb
 #### 1. Open a Database
 
 ```js
-const { FlowDB } = require('flowdb')
+const { FlowDB } = require('@restsend/flowdb')
 
 const db = FlowDB.open({ dataDir: './mydata' })
 ```
@@ -122,7 +122,7 @@ Always close the database when done to flush pending writes and release resource
 ### Full Example
 
 ```js
-const { FlowDB } = require('flowdb')
+const { FlowDB } = require('@restsend/flowdb')
 
 async function main() {
   const db = FlowDB.open({ dataDir: './demo' })
@@ -152,7 +152,7 @@ HTTP framework:
 
 ```js
 const express = require('express')
-const { FlowDB } = require('flowdb')
+const { FlowDB } = require('@restsend/flowdb')
 
 const db = FlowDB.open({ dataDir: './data' })
 const app = express()

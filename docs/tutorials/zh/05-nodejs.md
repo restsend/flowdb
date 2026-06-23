@@ -6,13 +6,13 @@
 
 ### 目标
 
-通过 `npm install flowdb` 在 Node.js 中使用 FlowDB —— 无需 Rust 工具链。
+通过 `npm install @restsend/flowdb` 在 Node.js 中使用 FlowDB —— 无需 Rust 工具链。
 FlowDB 提供与 IndexedDB 兼容的文档数据库，支持 ACID 事务、二级索引和唯一约束。
 
 ### 安装
 
 ```bash
-npm install flowdb
+npm install @restsend/flowdb
 ```
 
 ### 步骤
@@ -20,7 +20,7 @@ npm install flowdb
 #### 1. 打开数据库
 
 ```js
-const { FlowDB } = require('flowdb')
+const { FlowDB } = require('@restsend/flowdb')
 
 const db = FlowDB.open({ dataDir: './mydata' })
 ```
@@ -107,7 +107,7 @@ await db.close()
 ### 完整示例
 
 ```js
-const { FlowDB } = require('flowdb')
+const { FlowDB } = require('@restsend/flowdb')
 
 async function main() {
   const db = FlowDB.open({ dataDir: './demo' })
@@ -136,7 +136,7 @@ FlowDB 是原生 Node.js 插件，可用任意 HTTP 框架包装：
 
 ```js
 const express = require('express')
-const { FlowDB } = require('flowdb')
+const { FlowDB } = require('@restsend/flowdb')
 
 const db = FlowDB.open({ dataDir: './data' })
 const app = express()
