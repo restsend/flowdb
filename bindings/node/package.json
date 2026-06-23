@@ -24,7 +24,7 @@
     "build:debug": "napi build --platform && npx tsc",
     "artifacts": "napi artifacts",
     "prepublishOnly": "node scripts/publish-platforms.js",
-    "test": "node -e \"const m = require('./index.js'); const db = m.FlowDb.open({dataDir:'/tmp/test',createIfMissing:true}); db.close(); console.log('ok')\""
+    "test": "node -e \"const m = require('./index.js'); const db = m.FlowDB.open({dataDir:'/tmp/test',createIfMissing:true}); db.close(); console.log('ok')\""
   },
   "optionalDependencies": {
     "@restsend/flowdb-darwin-arm64": "0.7.3",

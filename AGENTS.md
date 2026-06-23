@@ -125,7 +125,7 @@ cd bindings/node && napi build --platform --release
 ### Test
 
 ```bash
-cd bindings/node && node -e "const m=require('.'); m.FlowDb.open({dataDir:'/tmp/t',createIfMissing:true}).close()"
+cd bindings/node && node -e "const m=require('.'); m.FlowDB.open({dataDir:'/tmp/t',createIfMissing:true}).close()"
 ```
 
 ### Cross-platform publishing (local, no GitHub CI)
