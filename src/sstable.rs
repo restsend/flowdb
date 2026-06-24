@@ -214,8 +214,18 @@ impl SstWriter {
             let min_expire = chunk.iter().map(|r| r.expire_at).min().unwrap_or(0);
             let max_expire = chunk.iter().map(|r| r.expire_at).max().unwrap_or(0);
 
-            let first_key = chunk.first().map(|r| r.key.clone()).unwrap_or_default();
-            let last_key = chunk.last().map(|r| r.key.clone()).unwrap_or_default();
+            let first_key = chunk
+                .iter()
+                .map(|r| r.key.as_slice())
+                .min()
+                .map(|k| k.to_vec())
+                .unwrap_or_default();
+            let last_key = chunk
+                .iter()
+                .map(|r| r.key.as_slice())
+                .max()
+                .map(|k| k.to_vec())
+                .unwrap_or_default();
 
             let header = BlockHeader {
                 num_records: chunk.len() as u32,
@@ -342,13 +352,17 @@ impl SstStreamWriter {
 
         let first_key = self
             .current_block
-            .first()
-            .map(|r| r.key.clone())
+            .iter()
+            .map(|r| r.key.as_slice())
+            .min()
+            .map(|k| k.to_vec())
             .unwrap_or_default();
         let last_key = self
             .current_block
-            .last()
-            .map(|r| r.key.clone())
+            .iter()
+            .map(|r| r.key.as_slice())
+            .max()
+            .map(|k| k.to_vec())
             .unwrap_or_default();
 
         let header = BlockHeader {

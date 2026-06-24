@@ -10,10 +10,42 @@
 //!   - App data: todos owned by users with status/priority indexes
 //!   - Atomic transactions for sign-up (create user + session)
 //!   - Compound index queries ("my open todos, ordered by priority")
+//!   - Schema defined via #[derive(ObjectStore)] macro
 
-use flowdb::jsondb::{JsonDB, StoreSchema, TransactionMode};
-use flowdb::Config;
+use flowdb::jsondb::{JsonDB, TransactionMode};
+use flowdb::{Config, ObjectStore};
 use serde_json::Value;
+
+// ── Schema definitions via derive macro ───────────────────────────
+
+#[allow(dead_code)]
+#[derive(ObjectStore)]
+#[store(name = "users", key_path = "id")]
+struct UserStore {
+    id: String,
+    #[index(name = "by_email", unique)]
+    email: String,
+}
+
+#[allow(dead_code)]
+#[derive(ObjectStore)]
+#[store(name = "sessions", key_path = "token")]
+struct SessionStore {
+    token: String,
+    #[index(name = "by_user")]
+    user_id: String,
+}
+
+#[allow(dead_code)]
+#[derive(ObjectStore)]
+#[store(name = "todos", key_path = "id")]
+struct TodoStore {
+    id: String,
+    #[index(name = "by_user")]
+    user_id: String,
+    status: String,
+    priority: i64,
+}
 
 /// A tiny Supabase-like client built on JsonDB.
 struct SupaBase {
@@ -28,17 +60,14 @@ impl SupaBase {
         })
         .unwrap();
 
-        // ── Schema via StoreDef builder ─────────────────────────
-        db.apply_schemas(&[
-            StoreSchema::new("users", "id")
-                .with_index("by_email", &["email"], true),
-            StoreSchema::new("sessions", "token")
-                .with_index("by_user", &["user_id"], false),
-            StoreSchema::new("todos", "id")
-                .with_index("by_user_status", &["user_id", "status"], false)
-                .with_index("by_user_priority", &["user_id", "priority"], false),
-        ])
-        .unwrap();
+        // ── Schema via derive macro ──────────────────────────────
+        db.apply_schema::<UserStore>().unwrap();
+        db.apply_schema::<SessionStore>().unwrap();
+        db.apply_schema::<TodoStore>().unwrap();
+
+        // Compound indexes not expressible via single-field #[index]:
+        db.create_index("todos", "by_user_status", &["user_id", "status"], false).unwrap();
+        db.create_index("todos", "by_user_priority", &["user_id", "priority"], false).unwrap();
 
         Self { db }
     }
@@ -60,7 +89,7 @@ impl SupaBase {
             serde_json::json!({
                 "id": user_id,
                 "email": email,
-                "password": password,  // real app: hash this!
+                "password": password,
                 "created_at": now_iso(),
             }),
         )
@@ -122,13 +151,12 @@ impl SupaBase {
     }
 
     fn complete_todo(&self, user_id: &str, todo_id: &str) -> bool {
-        // RLS: only the owner can update.
         let mut doc = match self.db.get("todos", &serde_json::json!(todo_id)).unwrap() {
             Some(d) => d,
             None => return false,
         };
         if doc["user_id"] != user_id {
-            return false; // not owner → reject
+            return false;
         }
         doc["status"] = serde_json::json!("done");
         self.db.put("todos", doc).unwrap();
@@ -146,7 +174,6 @@ impl SupaBase {
     }
 
     fn count_by_status(&self, status: &str) -> usize {
-        // We use a full scan + filter; for production, create a status-only index.
         self.db
             .scan("todos")
             .unwrap()
@@ -221,19 +248,16 @@ fn uuid_v4() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    // Deterministic "UUID" for reproducibility.
     format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}", n, 0, 0, 0, 0)
 }
 
 fn now_iso() -> String {
-    // Quick ISO-8601 without pulling in chrono.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let days = secs / 86400;
     let time = secs % 86400;
-    // Crude date from Unix epoch (1970-01-01).
     let mut y = 1970i64;
     let mut remaining = days as i64;
     loop {
@@ -246,11 +270,7 @@ fn now_iso() -> String {
     }
     let mut m = 1u32;
     for days_in_month in &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] {
-        let dim = if m == 2 && is_leap(y) {
-            29
-        } else {
-            *days_in_month
-        };
+        let dim = if m == 2 && is_leap(y) { 29 } else { *days_in_month };
         if remaining < dim as i64 {
             break;
         }

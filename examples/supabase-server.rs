@@ -11,7 +11,8 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
-use flowdb::jsondb::{JsonDB, SortDir, StoreSchema, TransactionMode};
+use flowdb::jsondb::{JsonDB, SortDir, TransactionMode};
+use flowdb::ObjectStore;
 use flowdb::Config;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -329,6 +330,37 @@ async fn delete_todo_handler(
 
 // ── HTML UI is loaded from `supabase-ui.html` via include_str! ─────
 
+// ── Schema definitions via derive macro ───────────────────────────
+
+#[allow(dead_code)]
+#[derive(ObjectStore)]
+#[store(name = "users", key_path = "id")]
+struct UserStore {
+    id: String,
+    #[index(name = "by_email", unique)]
+    email: String,
+}
+
+#[derive(ObjectStore)]
+#[store(name = "sessions", key_path = "token")]
+#[allow(dead_code)]
+struct SessionStore {
+    token: String,
+    #[index(name = "by_user")]
+    user_id: String,
+}
+
+#[derive(ObjectStore)]
+#[allow(dead_code)]
+#[store(name = "todos", key_path = "id")]
+struct TodoStore {
+    id: String,
+    #[index(name = "by_user")]
+    user_id: String,
+    status: String,
+    priority: i64,
+}
+
 // ── Main ──────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -346,17 +378,14 @@ async fn main() {
     })
     .expect("failed to open JsonDB");
 
-    // Schema via StoreDef builder
-    db.apply_schemas(&[
-        StoreSchema::new("users", "id")
-            .with_index("by_email", &["email"], true),
-        StoreSchema::new("sessions", "token")
-            .with_index("by_user", &["user_id"], false),
-        StoreSchema::new("todos", "id")
-            .with_index("by_user_status", &["user_id", "status"], false)
-            .with_index("by_user_priority", &["user_id", "priority"], false),
-    ])
-    .unwrap();
+    // Schema via derive macro
+    db.apply_schema::<UserStore>().unwrap();
+    db.apply_schema::<SessionStore>().unwrap();
+    db.apply_schema::<TodoStore>().unwrap();
+
+    // Compound indexes (multi-field, not expressible via single #[index])
+    db.create_index("todos", "by_user_status", &["user_id", "status"], false).unwrap();
+    db.create_index("todos", "by_user_priority", &["user_id", "priority"], false).unwrap();
 
     let state = Arc::new(AppState { db });
 
