@@ -395,7 +395,7 @@ impl Engine {
             storage.clone(),
         )));
 
-        let mut engine = Self {
+        let engine = Self {
             config,
             worker,
             seq_counter,
