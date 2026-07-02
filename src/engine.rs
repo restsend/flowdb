@@ -93,7 +93,8 @@ pub struct Engine {
     cache: Arc<BlockCache>,
     readers: Arc<RwLock<HashMap<u32, Arc<SstReader>>>>,
     storage: Arc<dyn StorageBackend>,
-    maintenance: Option<MaintenanceHandle>,
+    maintenance: parking_lot::Mutex<Option<MaintenanceHandle>>,
+    is_closed: std::sync::atomic::AtomicBool,
     /// Serialises the read-modify-write in `patch_record` to prevent
     /// lost updates when two threads patch the same key concurrently.
     patch_lock: std::sync::Mutex<()>,
@@ -405,13 +406,14 @@ impl Engine {
             cache,
             readers,
             storage,
-            maintenance: None,
+            maintenance: parking_lot::Mutex::new(None),
+            is_closed: std::sync::atomic::AtomicBool::new(false),
             patch_lock: std::sync::Mutex::new(()),
         };
 
         // Auto-start periodic flush, compaction, GC, and WAL sync.
         if auto_bg {
-            engine.maintenance = engine.spawn_background_maintenance();
+            *engine.maintenance.lock() = engine.spawn_background_maintenance();
         }
 
         Ok(engine)
@@ -886,14 +888,8 @@ impl Engine {
 
     /// Shut down the engine, flushing the memtable and WAL.  Consumes
     /// `self` — use [`Engine::close`] if the engine is behind an `Arc`.
-    pub fn shutdown(mut self) -> Result<()> {
-        // Stop the background maintenance thread first to avoid
-        // concurrent flush/compact/gc during shutdown.
-        self.maintenance.take();
-        let mut worker = self.worker.worker.lock();
-        worker.do_flush()?;
-        worker.flush_wal()?;
-        Ok(())
+    pub fn shutdown(self) -> Result<()> {
+        self.close()
     }
 
     /// Flush the memtable and WAL without consuming `self`.
@@ -904,6 +900,13 @@ impl Engine {
     /// [`MaintenanceHandle`] first, or simply let `Engine::shutdown`
     /// consume it.
     pub fn close(&self) -> Result<()> {
+        if self.is_closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Stop background thread
+        *self.maintenance.lock() = None;
+
         let mut w = self.worker.worker.lock();
         w.do_flush()?;
         w.flush_wal()

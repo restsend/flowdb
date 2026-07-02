@@ -183,21 +183,21 @@ impl CompactionRunner {
         };
 
         {
+            let mut mf = self.manifest.lock();
+            mf.append(&ManifestEntry::Compaction {
+                removed: candidates.clone(),
+                added: vec![new_info.clone()],
+                blocks: vec![(new_sst_id, block_infos.clone())],
+            })?;
+        }
+
+        {
             let mut idx = self.index.write();
             for sst_id in &candidates {
                 idx.remove_sst(*sst_id);
             }
             idx.add_sst(new_sst_id, &block_infos);
             idx.set_bloom(new_sst_id, bloom);
-        }
-
-        {
-            let mut mf = self.manifest.lock();
-            mf.append(&ManifestEntry::Compaction {
-                removed: candidates.clone(),
-                added: vec![new_info],
-                blocks: vec![(new_sst_id, block_infos)],
-            })?;
         }
 
         for sst_id in &candidates {

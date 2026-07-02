@@ -118,13 +118,21 @@ impl Manifest {
 
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(entry) = serde_json::from_str::<ManifestEntry>(line) {
-                    apply_entry(&mut state, &entry);
+            let lines: Vec<&str> = content.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            for (i, line) in lines.iter().enumerate() {
+                match serde_json::from_str::<ManifestEntry>(line) {
+                    Ok(entry) => apply_entry(&mut state, &entry),
+                    Err(e) => {
+                        if i == lines.len() - 1 {
+                            tracing::warn!("Ignoring torn final manifest entry: {}", e);
+                        } else {
+                            return Err(crate::error::FlowError::Corruption {
+                                file: path.display().to_string(),
+                                msg: format!("Corrupted manifest entry at line {}: {}", i + 1, e),
+                            }
+                            .into());
+                        }
+                    }
                 }
             }
         }

@@ -27,18 +27,6 @@ fn compute_checksum(data: &[u8]) -> [u8; CHECKSUM_LEN] {
     (hash as u32).to_be_bytes()
 }
 
-/// Verifies the trailing checksum on a decoded record buffer.
-/// `record_bytes` is everything BEFORE the checksum trailer.
-/// `file_tail` is the remaining file data starting at the checksum position.
-/// Returns `true` if the checksum matches (or is too short to read → treated as
-/// corruption: returns `false`).
-fn verify_checksum(record_bytes: &[u8], file_tail: &[u8]) -> bool {
-    if file_tail.len() < CHECKSUM_LEN {
-        return false;
-    }
-    let expected = compute_checksum(record_bytes);
-    expected == file_tail[..CHECKSUM_LEN]
-}
 
 struct WalSegment {
     writer: std::io::BufWriter<std::fs::File>,
@@ -167,7 +155,21 @@ impl Wal {
         let val_len = read_u32(&data[pos..pos + 4]) as usize;
         pos += 4 + val_len;
 
-        // Account for the per-record checksum trailer.
+        if pos + CHECKSUM_LEN > data.len() {
+            return Ok(None);
+        }
+
+        let record_bytes = &data[start..pos];
+        let tail = &data[pos..pos + CHECKSUM_LEN];
+        let expected = compute_checksum(record_bytes);
+        if expected != tail {
+            return Err(crate::error::FlowError::Corruption {
+                file: "WAL".into(),
+                msg: "Checksum mismatch in WAL record".into(),
+            }
+            .into());
+        }
+
         pos += CHECKSUM_LEN;
 
         Ok(Some(pos - start))
@@ -263,7 +265,10 @@ impl Wal {
                         pos += advance;
                     }
                     Ok(None) => break,
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::error!("Corruption in WAL {}: {}", segment.path.display(), e);
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -410,12 +415,18 @@ fn decode_record(data: &[u8]) -> Result<Option<(InternalRecord, usize)>> {
     pos += val_len;
 
     // Verify per-record checksum.
-    let record_bytes = &data[..pos];
-    let tail = &data[pos..];
-    if !verify_checksum(record_bytes, tail) {
-        // Checksum failure: either truncated or corrupted.  Treat like a
-        // truncated record so replay stops here.
+    if pos + CHECKSUM_LEN > data.len() {
         return Ok(None);
+    }
+    let record_bytes = &data[..pos];
+    let tail = &data[pos..pos + CHECKSUM_LEN];
+    let expected = compute_checksum(record_bytes);
+    if expected != tail {
+        return Err(crate::error::FlowError::Corruption {
+            file: "WAL".into(),
+            msg: "Checksum mismatch in WAL record".into(),
+        }
+        .into());
     }
     pos += CHECKSUM_LEN;
 
@@ -842,15 +853,11 @@ mod tests {
         data[mid] ^= 0xFF;
         std::fs::write(&path, &data).unwrap();
 
-        let mut wal2 = Wal::open(dir.path(), 64).unwrap();
-        let result = wal2.replay_from(0).unwrap();
-        // The first record might still decode if the corruption is in the second
-        // record's checksum area, but the corrupted record itself must be rejected.
-        // Either way, we must not get corrupted data back.
+        let wal2_res = Wal::open(dir.path(), 64);
         assert!(
-            result.len() <= 1,
-            "corrupted records should be rejected, got {} records",
-            result.len()
+            wal2_res.is_err(),
+            "Wal::open should fail on corrupted data, got {:?}",
+            wal2_res.map(|w| w.segments.len())
         );
     }
 
@@ -886,12 +893,4 @@ mod tests {
         assert_ne!(cs1, cs3, "different data must have different checksums");
     }
 
-    #[test]
-    fn test_verify_checksum_truncated() {
-        let record_bytes = b"some record data";
-        // Empty tail → should fail.
-        assert!(!verify_checksum(record_bytes, &[]));
-        // Tail too short (3 bytes) → should fail.
-        assert!(!verify_checksum(record_bytes, &[0, 0, 0]));
-    }
 }

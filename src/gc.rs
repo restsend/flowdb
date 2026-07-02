@@ -52,14 +52,17 @@ impl GcRunner {
         }
 
         for sst_id in to_delete {
+            {
+                let mut mf = self.manifest.lock();
+                if let Err(e) = mf.append(&ManifestEntry::GcDeleteSst { sst_id }) {
+                    tracing::error!("GC: failed to append delete for SST {}: {}", sst_id, e);
+                    return Err(e);
+                }
+            }
             self.cache.invalidate_sst(sst_id);
             {
                 let mut idx = self.index.write();
                 idx.remove_sst(sst_id);
-            }
-            {
-                let mut mf = self.manifest.lock();
-                mf.append(&ManifestEntry::GcDeleteSst { sst_id })?;
             }
             if let Err(e) = self.storage.delete_sst(sst_id) {
                 tracing::warn!("GC: failed to delete SST {}: {}", sst_id, e);
