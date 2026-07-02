@@ -110,6 +110,7 @@ fn flowdb_config(dir: &Path) -> Config {
         create_if_missing: true,
         wal_sync_mode: flowdb::SyncMode::IntervalMs(u64::MAX),
         auto_background: false,
+        storage_backend: flowdb::StorageBackendKind::MultiFile,
     }
 }
 

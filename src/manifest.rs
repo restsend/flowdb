@@ -97,6 +97,7 @@ pub(crate) struct ManifestState {
 pub(crate) struct Manifest {
     path: PathBuf,
     state: ManifestState,
+    #[cfg(not(target_os = "windows"))]
     dir_file: std::fs::File,
     /// Number of appended entries since the last snapshot.  Used by
     /// [`maybe_snapshot`] to decide when to compact the log.
@@ -110,6 +111,7 @@ const SNAPSHOT_THRESHOLD: usize = 500;
 impl Manifest {
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        #[cfg(not(target_os = "windows"))]
         let dir_file = std::fs::File::open(dir)?;
         let path = dir.join("MANIFEST");
         let mut state = ManifestState::default();
@@ -130,6 +132,7 @@ impl Manifest {
         Ok(Self {
             path,
             state,
+            #[cfg(not(target_os = "windows"))]
             dir_file,
             entry_count: 0,
         })
@@ -145,6 +148,7 @@ impl Manifest {
         writeln!(file, "{}", line)?;
         file.flush()?;
         file.sync_all()?;
+        #[cfg(not(target_os = "windows"))]
         self.dir_file.sync_all()?;
 
         apply_entry(&mut self.state, entry);
@@ -207,6 +211,7 @@ impl Manifest {
 
         // Atomic rename
         std::fs::rename(&tmp_path, &self.path)?;
+        #[cfg(not(target_os = "windows"))]
         self.dir_file.sync_all()?;
         self.entry_count = self.state.sstables.len() + 1;
 

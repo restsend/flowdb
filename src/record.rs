@@ -192,6 +192,22 @@ pub enum SyncMode {
 ///
 /// Use `Config::default()` for sensible defaults, or construct inline:
 ///
+/// Selects the on-disk storage backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackendKind {
+    /// One `.sst` file per SST — the classic multi-file layout.
+    MultiFile,
+    /// All SSTs packed inside a single `.db` container file.
+    SingleFile,
+}
+
+impl Default for StorageBackendKind {
+    fn default() -> Self {
+        Self::MultiFile
+    }
+}
+
 /// ```no_run
 /// use flowdb::Config;
 ///
@@ -254,6 +270,11 @@ pub struct Config {
     /// manual control over maintenance operations.
     #[serde(default = "default_background")]
     pub auto_background: bool,
+    /// On-disk storage backend (default: `MultiFile`).
+    /// - `MultiFile`: one `.sst` file per SST under `{data_dir}/SST/`.
+    /// - `SingleFile`: all SSTs packed inside a single `{data_dir}/flow.db` file.
+    #[serde(default)]
+    pub storage_backend: StorageBackendKind,
 }
 
 fn default_background() -> bool {
@@ -279,6 +300,7 @@ impl Default for Config {
             create_if_missing: true,
             wal_sync_mode: SyncMode::Always,
             auto_background: true,
+            storage_backend: StorageBackendKind::MultiFile,
         }
     }
 }

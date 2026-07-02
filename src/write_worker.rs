@@ -5,6 +5,7 @@ use crate::memtable::MemTables;
 use crate::record::{Config, InternalRecord, SyncMode};
 use crate::sstable::SstWriter;
 use crate::stats::StatsCounters;
+use crate::storage::StorageBackend;
 use crate::wal::Wal;
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ pub(crate) struct WriteWorker {
     manifest: Arc<parking_lot::Mutex<Manifest>>,
     index: Arc<parking_lot::RwLock<BlockMetaIndex>>,
     stats: Arc<StatsCounters>,
+    storage: Arc<dyn StorageBackend>,
 }
 
 impl WriteWorker {
@@ -29,6 +31,7 @@ impl WriteWorker {
         manifest: Arc<parking_lot::Mutex<Manifest>>,
         index: Arc<parking_lot::RwLock<BlockMetaIndex>>,
         stats: Arc<StatsCounters>,
+        storage: Arc<dyn StorageBackend>,
     ) -> Self {
         Self {
             config,
@@ -37,6 +40,7 @@ impl WriteWorker {
             manifest,
             index,
             stats,
+            storage,
         }
     }
 
@@ -131,22 +135,13 @@ impl WriteWorker {
             sst_id = mf.next_sst_id();
         }
 
-        let sst_dir = self.config.data_dir.join("SST");
-        std::fs::create_dir_all(&sst_dir)?;
-        let sst_path = sst_dir.join(format!("{:09}.sst", sst_id));
-        let tmp_path = sst_path.with_extension("sst.tmp");
-
-        let (sst_bytes, block_infos, bloom) = SstWriter::write(
-            &tmp_path,
+        let (data, sst_bytes, block_infos, bloom) = SstWriter::write_to_buf(
             &all_records,
             self.config.block_size,
             self.config.bloom_bits_per_key,
         )?;
 
-        std::fs::rename(&tmp_path, &sst_path)?;
-
-        let sst_dir_file = std::fs::File::open(&sst_dir)?;
-        sst_dir_file.sync_all()?;
+        self.storage.write_sst(sst_id, &data)?;
 
         let min_ts = all_records.iter().map(|r| r.ts).min().unwrap_or(0);
         let max_ts = all_records.iter().map(|r| r.ts).max().unwrap_or(0);

@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const BLOCK_MAGIC_LZ4: u32 = 0x54534E42;
-const HEADER_SIZE: usize = 48;
+pub(crate) const HEADER_SIZE: usize = 48;
 
 pub(crate) struct SstBlock {
     pub records: Vec<InternalRecord>,
@@ -182,14 +182,18 @@ fn decode_records(data: &[u8], count: u32) -> Result<Vec<InternalRecord>> {
 pub(crate) struct SstWriter;
 
 impl SstWriter {
+    /// Encode an SST into an in-memory buffer.
+    ///
+    /// Returns `(data, total_bytes, block_infos, bloom)`.
+    /// The caller is responsible for persisting `data` via a
+    /// [`crate::storage::StorageBackend`].
     #[allow(clippy::too_many_arguments)]
-    pub fn write(
-        path: &Path,
+    pub fn write_to_buf(
         records: &[InternalRecord],
         block_size: usize,
         bloom_bits_per_key: usize,
-    ) -> Result<(u64, Vec<BlockInfo>, BloomFilter)> {
-        let mut file = std::fs::File::create(path)?;
+    ) -> Result<(Vec<u8>, u64, Vec<BlockInfo>, BloomFilter)> {
+        let mut buf = Vec::with_capacity(records.len() * 64);
         let mut block_infos = Vec::new();
         let mut total_bytes: u64 = 0;
 
@@ -238,8 +242,8 @@ impl SstWriter {
             };
 
             let header_bytes = header.to_bytes();
-            file.write_all(&header_bytes)?;
-            file.write_all(&compressed)?;
+            buf.extend_from_slice(&header_bytes);
+            buf.extend_from_slice(&compressed);
             total_bytes += HEADER_SIZE as u64 + compressed.len() as u64;
 
             block_infos.push(BlockInfo {
@@ -253,6 +257,24 @@ impl SstWriter {
             });
         }
 
+        Ok((buf, total_bytes, block_infos, bloom))
+    }
+
+    /// Write an SST directly to a file path (legacy multi-file API).
+    ///
+    /// Creates the file, writes all blocks, flushes, and fsyncs.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn write(
+        path: &Path,
+        records: &[InternalRecord],
+        block_size: usize,
+        bloom_bits_per_key: usize,
+    ) -> Result<(u64, Vec<BlockInfo>, BloomFilter)> {
+        let (data, total_bytes, block_infos, bloom) =
+            Self::write_to_buf(records, block_size, bloom_bits_per_key)?;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&data)?;
         file.flush()?;
         file.sync_all()?;
         Ok((total_bytes, block_infos, bloom))
@@ -265,39 +287,37 @@ impl SstWriter {
 /// Construction takes an *estimated* unique-key count for the bloom
 /// filter pre-allocation. An over-estimate is harmless (lower FPR).
 /// Records are buffered until a block is full, then compressed and
-/// appended to the file.  Call [`SstStreamWriter::finish`] to flush
-/// the last block, sync, and obtain metadata.
+/// appended to the internal buffer. Call [`SstStreamWriter::finish`] to
+/// flush the last block and obtain the serialized bytes + metadata.
 pub(crate) struct SstStreamWriter {
-    file: std::fs::File,
+    buf: Vec<u8>,
     block_size: usize,
     bloom: BloomFilter,
     current_block: Vec<InternalRecord>,
     block_infos: Vec<BlockInfo>,
     total_bytes: u64,
-    flushed: bool,
+    finished: bool,
 }
 
 impl SstStreamWriter {
     pub fn new(
-        path: &std::path::Path,
         block_size: usize,
         estimated_keys: usize,
         bloom_bits_per_key: usize,
     ) -> Result<Self> {
-        let file = std::fs::File::create(path)?;
         let bloom = BloomFilter::with_bits_per_key(estimated_keys.max(1), bloom_bits_per_key);
         Ok(Self {
-            file,
+            buf: Vec::new(),
             block_size,
             bloom,
             current_block: Vec::with_capacity(block_size),
             block_infos: Vec::new(),
             total_bytes: 0,
-            flushed: false,
+            finished: false,
         })
     }
 
-    /// Append a single record.  Automatically flushes the current block
+    /// Append a single record. Automatically flushes the current block
     /// when it reaches `block_size` records.
     pub fn write_record(&mut self, rec: &InternalRecord) -> Result<()> {
         self.bloom.insert(&rec.key);
@@ -309,16 +329,15 @@ impl SstStreamWriter {
         Ok(())
     }
 
-    /// Flush the final block (if any), sync the file, and return the
-    /// accumulated metadata.
-    pub fn finish(mut self) -> Result<(u64, Vec<BlockInfo>, BloomFilter)> {
+    /// Flush the final block (if any) and return the serialized bytes
+    /// plus accumulated metadata `(data, total_bytes, block_infos, bloom)`.
+    pub fn finish(mut self) -> Result<(Vec<u8>, u64, Vec<BlockInfo>, BloomFilter)> {
         if !self.current_block.is_empty() {
             self.flush_block()?;
         }
-        self.file.flush()?;
-        self.file.sync_all()?;
-        self.flushed = true;
+        self.finished = true;
         Ok((
+            std::mem::take(&mut self.buf),
             self.total_bytes,
             self.block_infos.clone(),
             self.bloom.clone(),
@@ -376,8 +395,8 @@ impl SstStreamWriter {
         };
 
         let header_bytes = header.to_bytes();
-        self.file.write_all(&header_bytes)?;
-        self.file.write_all(&compressed)?;
+        self.buf.extend_from_slice(&header_bytes);
+        self.buf.extend_from_slice(&compressed);
         self.total_bytes += HEADER_SIZE as u64 + compressed.len() as u64;
 
         self.block_infos.push(BlockInfo {
@@ -397,41 +416,97 @@ impl SstStreamWriter {
 
 impl Drop for SstStreamWriter {
     fn drop(&mut self) {
-        if !self.flushed && !self.current_block.is_empty() {
+        if !self.finished && !self.current_block.is_empty() {
             if let Err(e) = self.flush_block() {
                 tracing::error!("SstStreamWriter::drop: flush_block failed: {}", e);
-            }
-            if let Err(e) = self.file.sync_all() {
-                tracing::error!("SstStreamWriter::drop: sync_all failed: {}", e);
             }
         }
     }
 }
 
+/// Backing store for an [`SstReader`].
+enum SstBacking {
+    /// Owns the file handle and mmap (one-SST-per-file mode).
+    File {
+        _file: std::fs::File,
+        mmap: memmap2::Mmap,
+    },
+    /// Borrows a region of a shared mmap (single-file container mode).
+    /// Multiple SstReaders can share the same `Arc<Mmap>` with different
+    /// `base`/`len` ranges.
+    Region {
+        _mmap: Arc<memmap2::Mmap>,
+        base: usize,
+        len: usize,
+    },
+}
+
+impl SstBacking {
+    /// Returns the byte slice covering just this SST's data.
+    fn data(&self) -> &[u8] {
+        match self {
+            SstBacking::File { mmap, .. } => &mmap[..],
+            SstBacking::Region {
+                _mmap, base, len, ..
+            } => &_mmap[*base..*base + *len],
+        }
+    }
+}
+
 pub(crate) struct SstReader {
-    _file: std::fs::File,
-    mmap: memmap2::Mmap,
+    backing: SstBacking,
     sst_id: u32,
     block_offsets: Vec<u64>,
 }
 
 impl SstReader {
+    /// Open an SST from its own file path (multi-file mode).
     pub fn open(path: &Path, sst_id: u32, block_count: usize) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let total_size = file.metadata()?.len() as usize;
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Self::build(SstBacking::File { _file: file, mmap }, sst_id, block_count, total_size)
+    }
 
+    /// Open an SST from a shared mmap region (single-file mode).
+    /// `base` is the byte offset within the mmap where this SST's data
+    /// begins; `len` is the number of bytes in this SST's region.
+    pub fn open_region(
+        mmap: Arc<memmap2::Mmap>,
+        base: usize,
+        len: usize,
+        sst_id: u32,
+        block_count: usize,
+    ) -> Result<Self> {
+        Self::build(
+            SstBacking::Region {
+                _mmap: mmap,
+                base,
+                len,
+            },
+            sst_id,
+            block_count,
+            len,
+        )
+    }
+
+    fn build(
+        backing: SstBacking,
+        sst_id: u32,
+        block_count: usize,
+        total_size: usize,
+    ) -> Result<Self> {
+        let data = backing.data();
         let mut offsets = Vec::with_capacity(block_count);
         let mut pos: usize = 0;
         while pos + HEADER_SIZE <= total_size {
             offsets.push(pos as u64);
-            let header = BlockHeader::from_bytes(&mmap[pos..pos + HEADER_SIZE])?;
+            let header = BlockHeader::from_bytes(&data[pos..pos + HEADER_SIZE])?;
             pos += HEADER_SIZE + header.compressed_len as usize;
         }
 
         Ok(Self {
-            _file: file,
-            mmap,
+            backing,
             sst_id,
             block_offsets: offsets,
         })
@@ -490,7 +565,7 @@ impl SstReader {
                     block_idx,
                 })?;
 
-        let data = &self.mmap;
+        let data = self.backing.data();
         let pos = *offset as usize;
         if pos + HEADER_SIZE > data.len() {
             return Err(FlowError::Corruption {
@@ -537,7 +612,7 @@ impl SstReader {
                     block_idx,
                 })?;
 
-        let data = &self.mmap;
+        let data = self.backing.data();
         let pos = *offset as usize;
         if pos + HEADER_SIZE > data.len() {
             return Err(FlowError::Corruption {
@@ -671,10 +746,9 @@ mod tests {
 
     #[test]
     fn test_sst_stream_writer_empty() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("empty.sst");
-        let writer = SstStreamWriter::new(&path, 10, 0, 10).unwrap();
-        let (bytes, blocks, _bloom) = writer.finish().unwrap();
+        let writer = SstStreamWriter::new(10, 0, 10).unwrap();
+        let (data, bytes, blocks, _bloom) = writer.finish().unwrap();
+        assert!(data.is_empty(), "empty writer produces zero bytes");
         assert_eq!(bytes, 0, "empty writer produces zero bytes");
         assert!(blocks.is_empty());
     }
@@ -684,15 +758,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("single.sst");
         let records = make_records(5);
-        let mut writer = SstStreamWriter::new(&path, 100, 5, 10).unwrap();
+        let mut writer = SstStreamWriter::new(100, 5, 10).unwrap();
         for rec in &records {
             writer.write_record(rec).unwrap();
         }
-        let (bytes, blocks, bloom) = writer.finish().unwrap();
+        let (data, bytes, blocks, bloom) = writer.finish().unwrap();
         assert!(bytes > 0, "should have written data");
         assert_eq!(blocks.len(), 1, "all records → single block");
+        assert_eq!(data.len() as u64, bytes);
 
-        // Verify the SST can be read back.
+        // Persist and verify the SST can be read back.
+        std::fs::write(&path, &data).unwrap();
         let reader = SstReader::open(&path, 1, blocks.len()).unwrap();
         assert_eq!(reader.block_count(), 1);
         let block = reader.read_block(0, None).unwrap();
@@ -714,15 +790,16 @@ mod tests {
         let path = dir.path().join("multi.sst");
         let records = make_records(25);
         // block_size = 10 → 3 blocks (10 + 10 + 5)
-        let mut writer = SstStreamWriter::new(&path, 10, 25, 10).unwrap();
+        let mut writer = SstStreamWriter::new(10, 25, 10).unwrap();
         for rec in &records {
             writer.write_record(rec).unwrap();
         }
-        let (bytes, blocks, bloom) = writer.finish().unwrap();
+        let (data, bytes, blocks, bloom) = writer.finish().unwrap();
         assert!(bytes > 0);
         assert_eq!(blocks.len(), 3);
 
         // Verify full read-back.
+        std::fs::write(&path, &data).unwrap();
         let reader = SstReader::open(&path, 1, blocks.len()).unwrap();
         let mut all_records = Vec::new();
         for i in 0..reader.block_count() {
@@ -749,11 +826,12 @@ mod tests {
 
         let records = make_records(50);
         // Stream write
-        let mut sw = SstStreamWriter::new(&s_path, 10, 50, 10).unwrap();
+        let mut sw = SstStreamWriter::new(10, 50, 10).unwrap();
         for rec in &records {
             sw.write_record(rec).unwrap();
         }
-        let (_, s_blocks, _) = sw.finish().unwrap();
+        let (s_data, _, s_blocks, _) = sw.finish().unwrap();
+        std::fs::write(&s_path, &s_data).unwrap();
         // Batch write
         let (_, b_blocks, _) = SstWriter::write(&b_path, &records, 10, 10).unwrap();
 
@@ -778,5 +856,42 @@ mod tests {
                 assert_eq!(s_rec.value, b_rec.value);
             }
         }
+    }
+
+    #[test]
+    fn test_sst_reader_open_region() {
+        // Verify SstReader::open_region works for a byte range within a larger buffer.
+        let records = make_records(30);
+        let (data, _, block_infos, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+
+        // Simulate a container file: header padding + SST data + trailing junk
+        let padding = 128usize;
+        let trailing = 64usize;
+        let mut container = Vec::with_capacity(padding + data.len() + trailing);
+        container.extend_from_slice(&vec![0u8; padding]);
+        container.extend_from_slice(&data);
+        container.extend_from_slice(&vec![0xFFu8; trailing]);
+
+        // Write container to a temp file and mmap it
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("container.db");
+        std::fs::write(&path, &container).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let mmap = Arc::new(mmap);
+
+        // Open a reader pointing at just the SST region
+        let reader =
+            SstReader::open_region(mmap, padding, data.len(), 42, block_infos.len()).unwrap();
+        assert_eq!(reader.block_count(), block_infos.len() as u32);
+
+        // Read all blocks and verify
+        let mut all = Vec::new();
+        for i in 0..reader.block_count() {
+            all.extend(reader.read_block(i, None).unwrap().records);
+        }
+        assert_eq!(all.len(), 30);
+        assert_eq!(all[0].key, b"key_0000");
+        assert_eq!(all[29].key, b"key_0029");
     }
 }

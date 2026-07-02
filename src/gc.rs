@@ -3,30 +3,31 @@ use crate::cache::BlockCache;
 use crate::error::Result;
 use crate::manifest::{Manifest, ManifestEntry};
 use crate::stats::StatsCounters;
+use crate::storage::StorageBackend;
 use std::sync::Arc;
 
 pub(crate) struct GcRunner {
-    data_dir: std::path::PathBuf,
     manifest: Arc<parking_lot::Mutex<Manifest>>,
     index: Arc<parking_lot::RwLock<BlockMetaIndex>>,
     cache: Arc<BlockCache>,
     stats: Arc<StatsCounters>,
+    storage: Arc<dyn StorageBackend>,
 }
 
 impl GcRunner {
     pub fn new(
-        data_dir: std::path::PathBuf,
         manifest: Arc<parking_lot::Mutex<Manifest>>,
         index: Arc<parking_lot::RwLock<BlockMetaIndex>>,
         cache: Arc<BlockCache>,
         stats: Arc<StatsCounters>,
+        storage: Arc<dyn StorageBackend>,
     ) -> Self {
         Self {
-            data_dir,
             manifest,
             index,
             cache,
             stats,
+            storage,
         }
     }
 
@@ -60,9 +61,8 @@ impl GcRunner {
                 let mut mf = self.manifest.lock();
                 mf.append(&ManifestEntry::GcDeleteSst { sst_id })?;
             }
-            let sst_path = self.data_dir.join("SST").join(format!("{:09}.sst", sst_id));
-            if let Err(e) = std::fs::remove_file(&sst_path) {
-                tracing::warn!("GC: failed to delete SST file {:?}: {}", sst_path, e);
+            if let Err(e) = self.storage.delete_sst(sst_id) {
+                tracing::warn!("GC: failed to delete SST {}: {}", sst_id, e);
             }
         }
 

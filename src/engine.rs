@@ -10,6 +10,7 @@ use crate::record::{
 };
 use crate::sstable::SstReader;
 use crate::stats::{EngineStats, StatsCounters};
+use crate::storage::{self, StorageBackend};
 use crate::wal::Wal;
 use crate::write_worker::{Completion, Submission, WritePipeline, WriteWorker};
 use parking_lot::RwLock;
@@ -91,6 +92,7 @@ pub struct Engine {
     manifest: Arc<parking_lot::Mutex<Manifest>>,
     cache: Arc<BlockCache>,
     readers: Arc<RwLock<HashMap<u32, Arc<SstReader>>>>,
+    storage: Arc<dyn StorageBackend>,
     maintenance: Option<MaintenanceHandle>,
     /// Serialises the read-modify-write in `patch_record` to prevent
     /// lost updates when two threads patch the same key concurrently.
@@ -116,7 +118,7 @@ impl Engine {
         let cache = self.cache.clone();
         let stats = self.stats.clone();
         let readers = self.readers.clone();
-        let data_dir = self.config.data_dir.clone();
+        let storage = self.storage.clone();
         let block_size = self.config.block_size;
         let bloom_bits = self.config.bloom_bits_per_key;
         let compaction_threshold = self.config.compaction_threshold;
@@ -168,7 +170,6 @@ impl Engine {
                         let sst_count = manifest.lock().state().sstables.len();
                         if sst_count >= compaction_threshold {
                             let compaction = crate::compaction::CompactionRunner::new(
-                                data_dir.clone(),
                                 block_size,
                                 bloom_bits,
                                 compaction_threshold,
@@ -176,6 +177,7 @@ impl Engine {
                                 index.clone(),
                                 cache.clone(),
                                 stats.clone(),
+                                storage.clone(),
                             );
                             match compaction.run() {
                                 Ok(true) => {
@@ -198,11 +200,11 @@ impl Engine {
 
                     if now.duration_since(last_gc) >= gc_dur {
                         let gc = crate::gc::GcRunner::new(
-                            data_dir.clone(),
                             manifest.clone(),
                             index.clone(),
                             cache.clone(),
                             stats.clone(),
+                            storage.clone(),
                         );
                         match gc.run() {
                             Ok(n) if n > 0 => {
@@ -258,9 +260,17 @@ impl Engine {
         }
         std::fs::create_dir_all(data_dir)?;
         std::fs::create_dir_all(data_dir.join("WAL"))?;
-        std::fs::create_dir_all(data_dir.join("SST"))?;
-        std::fs::create_dir_all(data_dir.join("INDEX"))?;
+        if matches!(config.storage_backend, crate::record::StorageBackendKind::MultiFile) {
+            std::fs::create_dir_all(data_dir.join("SST"))?;
+        }
 
+        let storage = storage::open_storage(
+            data_dir,
+            matches!(
+                config.storage_backend,
+                crate::record::StorageBackendKind::SingleFile
+            ),
+        )?;
         let stats = Arc::new(StatsCounters::new());
         let mut wal = Wal::open(&data_dir.join("WAL"), config.wal_segment_size_mb)?;
         let mut manifest = Manifest::open(data_dir)?;
@@ -306,7 +316,7 @@ impl Engine {
             );
             for sst_id in &stale_ssts {
                 if let Err(e) = Engine::rebuild_bloom_for_sst(
-                    &config,
+                    &storage,
                     &mut manifest,
                     &mut index,
                     *sst_id,
@@ -381,6 +391,7 @@ impl Engine {
             manifest.clone(),
             index.clone(),
             stats.clone(),
+            storage.clone(),
         )));
 
         let mut engine = Self {
@@ -393,6 +404,7 @@ impl Engine {
             manifest,
             cache,
             readers,
+            storage,
             maintenance: None,
             patch_lock: std::sync::Mutex::new(()),
         };
@@ -529,7 +541,7 @@ impl Engine {
             &self.memtables,
             &self.index,
             &self.cache,
-            &self.config,
+            &self.storage,
             &self.readers,
             now_us,
         )?;
@@ -606,7 +618,7 @@ impl Engine {
         sst_id: u32,
         block_idx: u32,
     ) -> Option<Record> {
-        let reader = match Engine::get_reader(&self.readers, &self.config, sst_id) {
+        let reader = match Engine::get_reader(&self.readers, &self.storage, sst_id) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
@@ -744,7 +756,7 @@ impl Engine {
 
     fn get_reader(
         readers: &Arc<RwLock<HashMap<u32, Arc<SstReader>>>>,
-        config: &Config,
+        storage: &Arc<dyn StorageBackend>,
         sst_id: u32,
     ) -> Result<Arc<SstReader>> {
         {
@@ -753,34 +765,26 @@ impl Engine {
                 return Ok(reader.clone());
             }
         }
-        let path = config
-            .data_dir
-            .join("SST")
-            .join(format!("{:09}.sst", sst_id));
-        if !path.exists() {
+        if !storage.sst_exists(sst_id) {
             return Err(FlowError::Other(format!("sst {} not found", sst_id)));
         }
-        let reader = Arc::new(SstReader::open(&path, sst_id, 0)?);
+        let reader = Arc::new(storage.open_reader(sst_id, 0)?);
         readers.write().insert(sst_id, reader.clone());
         Ok(reader)
     }
 
     fn get_reader_from_map(
         readers: &HashMap<u32, Arc<SstReader>>,
-        config: &Config,
+        storage: &Arc<dyn StorageBackend>,
         sst_id: u32,
     ) -> Result<Arc<SstReader>> {
         if let Some(reader) = readers.get(&sst_id) {
             return Ok(reader.clone());
         }
-        let path = config
-            .data_dir
-            .join("SST")
-            .join(format!("{:09}.sst", sst_id));
-        if !path.exists() {
+        if !storage.sst_exists(sst_id) {
             return Err(FlowError::Other(format!("sst {} not found", sst_id)));
         }
-        Ok(Arc::new(SstReader::open(&path, sst_id, 0)?))
+        Ok(Arc::new(storage.open_reader(sst_id, 0)?))
     }
 
     /// Rebuild the persisted bloom filter for `sst_id` using the current
@@ -792,26 +796,22 @@ impl Engine {
     /// This is a one-time migration cost; subsequent startups find the
     /// persisted version matches `CURRENT_HASH_VERSION` and skip the rebuild.
     fn rebuild_bloom_for_sst(
-        config: &Config,
+        storage: &Arc<dyn StorageBackend>,
         manifest: &mut Manifest,
         index: &mut BlockMetaIndex,
         sst_id: u32,
         bits_per_key: usize,
     ) -> Result<()> {
-        let path = config
-            .data_dir
-            .join("SST")
-            .join(format!("{:09}.sst", sst_id));
-        if !path.exists() {
+        if !storage.sst_exists(sst_id) {
             return Err(FlowError::Other(format!(
                 "rebuild_bloom: sst {} file missing",
                 sst_id
             )));
         }
 
-        // Open the reader with `block_count=0` — SstReader::open walks the
-        // file to discover block boundaries, so 0 just means "no hint".
-        let reader = SstReader::open(&path, sst_id, 0)?;
+        // Open the reader with `block_count=0` — SstReader walks the
+        // SST to discover block boundaries, so 0 just means "no hint".
+        let reader = storage.open_reader(sst_id, 0)?;
         let block_count = reader.block_count();
 
         // Collect unique keys in insertion order. We do NOT need values.
@@ -857,11 +857,11 @@ impl Engine {
 
     pub fn trigger_gc(&self) -> Result<u64> {
         let gc = GcRunner::new(
-            self.config.data_dir.clone(),
             self.manifest.clone(),
             self.index.clone(),
             self.cache.clone(),
             self.stats.clone(),
+            self.storage.clone(),
         );
         let purged = gc.run()?;
         self.evict_stale_readers();
@@ -870,7 +870,6 @@ impl Engine {
 
     pub fn trigger_compaction(&self) -> Result<bool> {
         let compaction = CompactionRunner::new(
-            self.config.data_dir.clone(),
             self.config.block_size,
             self.config.bloom_bits_per_key,
             self.config.compaction_threshold,
@@ -878,6 +877,7 @@ impl Engine {
             self.index.clone(),
             self.cache.clone(),
             self.stats.clone(),
+            self.storage.clone(),
         );
         let did = compaction.run()?;
         self.evict_stale_readers();
@@ -935,7 +935,7 @@ impl Engine {
             &self.memtables,
             &self.index,
             &self.cache,
-            &self.config,
+            &self.storage,
             &self.readers,
             now_us,
         )
@@ -999,7 +999,7 @@ impl Engine {
         sst_id: u32,
         block_idx: u32,
     ) -> Option<Record> {
-        let reader = match Engine::get_reader(&self.readers, &self.config, sst_id) {
+        let reader = match Engine::get_reader(&self.readers, &self.storage, sst_id) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
@@ -1151,7 +1151,7 @@ impl ScanIterator {
         memtables: &Arc<MemTables>,
         index: &Arc<RwLock<BlockMetaIndex>>,
         cache: &Arc<BlockCache>,
-        config: &Config,
+        storage: &Arc<dyn StorageBackend>,
         readers: &Arc<RwLock<HashMap<u32, Arc<SstReader>>>>,
         now_us: i64,
     ) -> Result<Self> {
@@ -1206,7 +1206,7 @@ impl ScanIterator {
         if is_full_scan {
             for meta in &candidates {
                 let reader =
-                    match Engine::get_reader_from_map(&readers_snapshot, config, meta.sst_id) {
+                    match Engine::get_reader_from_map(&readers_snapshot, storage, meta.sst_id) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!(
@@ -1252,7 +1252,7 @@ impl ScanIterator {
         } else {
             for meta in &candidates {
                 let reader =
-                    match Engine::get_reader_from_map(&readers_snapshot, config, meta.sst_id) {
+                    match Engine::get_reader_from_map(&readers_snapshot, storage, meta.sst_id) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!(
@@ -1540,6 +1540,7 @@ mod tests {
             create_if_missing: true,
             wal_sync_mode: SyncMode::IntervalMs(u64::MAX),
             auto_background: false,
+            storage_backend: crate::record::StorageBackendKind::MultiFile,
         }
     }
 
@@ -3367,5 +3368,360 @@ mod tests {
             lines_before, lines_after,
             "manifest should not change when below threshold"
         );
+    }
+
+    // ── Single-file storage backend tests ──────────────────────────
+
+    fn make_config_single_file(dir: &std::path::Path) -> Config {
+        let mut config = make_config(dir);
+        config.storage_backend = crate::record::StorageBackendKind::SingleFile;
+        config
+    }
+
+    #[test]
+    fn test_single_file_engine_write_read() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        engine
+            .write_batch(&[make_record("a", 100), make_record("b", 200)])
+            .unwrap();
+
+        let results = engine.query_by_prefix("").unwrap();
+        assert_eq!(results.len(), 2);
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_flush_and_query() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        let records: Vec<Record> = (0..50)
+            .map(|i| make_record(&format!("key_{:04}", i), i * 10))
+            .collect();
+        engine.write_batch(&records).unwrap();
+        engine.flush().unwrap();
+
+        let results = engine.query_by_prefix("key_").unwrap();
+        assert_eq!(results.len(), 50);
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_db_file_exists() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        engine.write_batch(&[make_record("a", 1)]).unwrap();
+        engine.flush().unwrap();
+
+        // The flow.db file should exist.
+        assert!(
+            dir.path().join("flow.db").exists(),
+            "flow.db should exist in single-file mode"
+        );
+
+        // The SST directory should NOT contain any .sst files.
+        let sst_dir = dir.path().join("SST");
+        if sst_dir.exists() {
+            let sst_count = std::fs::read_dir(&sst_dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .map(|e| e.file_name().to_string_lossy().ends_with(".sst"))
+                        .unwrap_or(false)
+                })
+                .count();
+            assert_eq!(sst_count, 0, "no .sst files should exist in single-file mode");
+        }
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_compaction() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        for batch in 0..10u64 {
+            let records: Vec<Record> = (0..5)
+                .map(|i| Record {
+                    key: format!("compact_{}-{}", batch, i).into_bytes(),
+                    ts: (batch * 100 + i) as i64,
+                    expire_at: i64::MAX,
+                    value: vec![1, 2, 3],
+                })
+                .collect();
+            engine.write_batch(&records).unwrap();
+            engine.flush().unwrap();
+        }
+
+        let did = engine.trigger_compaction().unwrap();
+        assert!(did, "compaction should have run");
+
+        let results = engine.query_by_prefix("compact_").unwrap();
+        assert_eq!(results.len(), 50, "all records should survive compaction");
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_gc() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+
+        let records: Vec<Record> = (0..10)
+            .map(|i| Record {
+                key: format!("gc_key_{}", i).into_bytes(),
+                ts: now_us,
+                expire_at: i64::MAX,
+                value: vec![1, 2, 3],
+            })
+            .collect();
+
+        engine.write_batch_ttl(&records, Some(1)).unwrap();
+        engine.flush().unwrap();
+
+        let results = engine.query_by_prefix("gc_key_").unwrap();
+        assert_eq!(results.len(), 10);
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let purged = engine.trigger_gc().unwrap();
+        assert!(purged > 0, "GC should have purged records");
+
+        // Query should return nothing (all expired).
+        let results = engine.query_by_prefix("gc_key_").unwrap();
+        assert_eq!(results.len(), 0);
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_recovery() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+
+        {
+            let engine = Engine::open(config.clone()).unwrap();
+            engine
+                .write_batch(&[
+                    make_record("persist_a", 100),
+                    make_record("persist_b", 200),
+                ])
+                .unwrap();
+            engine.flush().unwrap();
+            engine.shutdown().unwrap();
+        }
+
+        {
+            let engine = Engine::open(config).unwrap();
+            let results = engine.query_by_prefix("persist_").unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].key, b"persist_a");
+            assert_eq!(results[1].key, b"persist_b");
+            engine.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_single_file_engine_concurrent_writes() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Arc::new(Engine::open(config).unwrap());
+
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let eng = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25u64 {
+                    let key = format!("t{}-key{}", t, i);
+                    eng.write_batch(&[Record {
+                        key: key.into_bytes(),
+                        ts: (t * 100 + i) as i64,
+                        expire_at: i64::MAX,
+                        value: vec![1, 2, 3, 4],
+                    }])
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        engine.flush().unwrap();
+
+        let results = engine.query_by_prefix("").unwrap();
+        assert_eq!(results.len(), 100);
+
+        // Can't call shutdown on Arc<Engine>, just drop.
+        let _ = engine.flush();
+    }
+
+    #[test]
+    fn test_single_file_engine_point_lookup_after_flush() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        let records: Vec<Record> = (0..20)
+            .map(|i| make_record(&format!("pt_{:03}", i), i * 10))
+            .collect();
+        engine.write_batch(&records).unwrap();
+        engine.flush().unwrap();
+
+        // Point lookup should find the latest version.
+        let result = engine.get_latest("pt_010").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().ts, 100);
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_scan_after_flush() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        let records: Vec<Record> = (0..30)
+            .map(|i| make_record(&format!("scan_{:03}", i), i))
+            .collect();
+        engine.write_batch(&records).unwrap();
+        engine.flush().unwrap();
+
+        let iter = engine.scan_prefix("scan_").unwrap();
+        let collected: Vec<Record> = iter.collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(collected.len(), 30);
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_multi_sst_query() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        // Create multiple SSTs
+        for batch in 0..5u64 {
+            let records: Vec<Record> = (0..10)
+                .map(|i| make_record(&format!("b{}-{:02}", batch, i), (batch * 100 + i) as i64))
+                .collect();
+            engine.write_batch(&records).unwrap();
+            engine.flush().unwrap();
+        }
+
+        // Query across all SSTs
+        let results = engine.query_by_prefix("b").unwrap();
+        assert_eq!(results.len(), 50);
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_overwrite_and_compact() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        // Write initial data
+        let r1: Vec<Record> = (0..10)
+            .map(|i| Record {
+                key: format!("ow_{:02}", i).into_bytes(),
+                ts: 1,
+                expire_at: i64::MAX,
+                value: vec![1],
+            })
+            .collect();
+        engine.write_batch(&r1).unwrap();
+        engine.flush().unwrap();
+
+        // Overwrite with newer timestamps
+        let r2: Vec<Record> = (0..10)
+            .map(|i| Record {
+                key: format!("ow_{:02}", i).into_bytes(),
+                ts: 2,
+                expire_at: i64::MAX,
+                value: vec![2],
+            })
+            .collect();
+        engine.write_batch(&r2).unwrap();
+        engine.flush().unwrap();
+
+        // Compact to merge the two SSTs
+        engine.trigger_compaction().unwrap();
+
+        // Both versions exist (compaction dedups by key+ts, not key alone)
+        let results = engine.query_by_prefix("ow_").unwrap();
+        assert_eq!(results.len(), 20);
+
+        // But get_latest returns the newest version
+        for i in 0..10 {
+            let latest = engine.get_latest(&format!("ow_{:02}", i)).unwrap();
+            assert!(latest.is_some());
+            assert_eq!(latest.unwrap().ts, 2, "latest version should have ts=2");
+        }
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_delete_range() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        let records: Vec<Record> = (0..20)
+            .map(|i| make_record(&format!("dr_{:03}", i), i))
+            .collect();
+        engine.write_batch(&records).unwrap();
+        engine.flush().unwrap();
+
+        // Delete records 5–14
+        engine
+            .delete_range("dr_005", "dr_015")
+            .unwrap();
+
+        let results = engine.query_by_prefix("dr_").unwrap();
+        // dr_000–dr_004 survive (5) + dr_015–dr_019 survive (5) = 10
+        assert_eq!(results.len(), 10);
+
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_single_file_engine_bloom_filter() {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+        let engine = Engine::open(config).unwrap();
+
+        let records: Vec<Record> = (0..50)
+            .map(|i| make_record(&format!("bf_{:03}", i), i))
+            .collect();
+        engine.write_batch(&records).unwrap();
+        engine.flush().unwrap();
+
+        // Key that exists
+        assert!(engine.get_latest("bf_025").unwrap().is_some());
+
+        // Key that doesn't exist (bloom should quickly reject)
+        assert!(engine.get_latest("nonexistent").unwrap().is_none());
+
+        engine.shutdown().unwrap();
     }
 }

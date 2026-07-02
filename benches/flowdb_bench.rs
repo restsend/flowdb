@@ -1,5 +1,5 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use flowdb::{Config, Engine, Query, Record};
+use flowdb::{Config, Engine, Query, Record, StorageBackendKind};
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::io::Write;
@@ -47,6 +47,7 @@ fn make_config(dir: &Path) -> Config {
         create_if_missing: true,
         wal_sync_mode: flowdb::SyncMode::IntervalMs(u64::MAX),
         auto_background: false,
+        storage_backend: StorageBackendKind::MultiFile,
     }
 }
 

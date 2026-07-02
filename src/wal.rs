@@ -53,12 +53,14 @@ pub(crate) struct Wal {
     max_segment_bytes: u64,
     next_seq: AtomicU64,
     next_segment_id: u64,
+    #[cfg(not(target_os = "windows"))]
     dir_file: std::fs::File,
 }
 
 impl Wal {
     pub fn open(dir: &Path, segment_size_mb: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        #[cfg(not(target_os = "windows"))]
         let dir_file = std::fs::File::open(dir)?;
         let mut wal = Self {
             dir: dir.to_path_buf(),
@@ -66,6 +68,7 @@ impl Wal {
             max_segment_bytes: segment_size_mb * 1024 * 1024,
             next_seq: AtomicU64::new(1),
             next_segment_id: 1,
+            #[cfg(not(target_os = "windows"))]
             dir_file,
         };
         wal.load_existing()?;
@@ -212,6 +215,7 @@ impl Wal {
             seg.writer.flush()?;
             seg.writer.get_mut().sync_all()?;
         }
+        #[cfg(not(target_os = "windows"))]
         self.dir_file.sync_all()?;
         Ok(())
     }

@@ -1,5 +1,5 @@
 use arbitrary::{Arbitrary, Unstructured};
-use flowdb::{Config, Engine, Query, Record};
+use flowdb::{Config, Engine, Query, Record, StorageBackendKind};
 use tempfile::TempDir;
 
 const FUZZ_ITERS: u64 = 200;
@@ -22,7 +22,14 @@ fn make_config(dir: &std::path::Path) -> Config {
         create_if_missing: true,
         wal_sync_mode: flowdb::SyncMode::IntervalMs(u64::MAX),
         auto_background: false,
+        storage_backend: StorageBackendKind::MultiFile,
     }
+}
+
+fn make_config_single_file(dir: &std::path::Path) -> Config {
+    let mut config = make_config(dir);
+    config.storage_backend = StorageBackendKind::SingleFile;
+    config
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +345,130 @@ fn fuzz_block_meta_index_queries() {
 
         if let Some(key) = all_keys.first() {
             let _ = engine.query_prefix_time_range(key, 0, 1_000_000).unwrap();
+        }
+
+        engine.shutdown().unwrap();
+        drop(dir);
+    }
+}
+
+// ── Single-file backend fuzz tests ───────────────────────────────────
+// These mirror the most critical multi-file fuzz tests but exercise
+// the SingleFileStorage backend. Reduced iteration count to keep
+// total test time reasonable (the container scan is slower on reopen).
+
+const SF_FUZZ_ITERS: u64 = 100;
+
+#[test]
+fn fuzz_single_file_sstable_write_read() {
+    for seed in 0..SF_FUZZ_ITERS {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+
+        let data = generate_seed_data(seed);
+        let mut u = Unstructured::new(&data);
+        let fuzz_records = gen_records(&mut u, 20);
+        if fuzz_records.is_empty() {
+            continue;
+        }
+
+        let records: Vec<Record> = fuzz_records.iter().map(to_record).collect();
+
+        let engine = Engine::open(config).unwrap();
+        engine.write_batch(&records).unwrap();
+        engine.flush().unwrap();
+
+        for fr in &fuzz_records {
+            let results = engine.query_by_prefix(&fr.key).unwrap();
+            let found = results.iter().any(|r| r.ts == fr.ts && r.value == fr.value);
+            assert!(
+                found,
+                "sf seed={}: record key={} ts={} not found after flush",
+                seed, fr.key, fr.ts
+            );
+        }
+        engine.shutdown().unwrap();
+        drop(dir);
+    }
+}
+
+#[test]
+fn fuzz_single_file_manifest_recovery() {
+    for seed in 0..SF_FUZZ_ITERS {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+
+        let data = generate_seed_data(seed);
+        let mut u = Unstructured::new(&data);
+
+        let fuzz_records = gen_records(&mut u, 20);
+        if fuzz_records.is_empty() {
+            continue;
+        }
+        let records: Vec<Record> = fuzz_records.iter().map(to_record).collect();
+
+        {
+            let engine = Engine::open(config.clone()).unwrap();
+            engine.write_batch(&records).unwrap();
+            engine.flush().unwrap();
+
+            let fuzz_more = gen_records(&mut u, 10);
+            let more_records: Vec<Record> = fuzz_more.iter().map(to_record).collect();
+            if !more_records.is_empty() {
+                engine.write_batch(&more_records).unwrap();
+            }
+
+            engine.shutdown().unwrap();
+        }
+
+        let engine2 = Engine::open(config).unwrap();
+        for fr in &fuzz_records {
+            let results = engine2.query_by_prefix(&fr.key).unwrap();
+            let found = results.iter().any(|r| r.ts == fr.ts && r.value == fr.value);
+            assert!(
+                found,
+                "sf seed={}: record key={} ts={} lost after recovery",
+                seed, fr.key, fr.ts
+            );
+        }
+        engine2.shutdown().unwrap();
+        drop(dir);
+    }
+}
+
+#[test]
+fn fuzz_single_file_multi_flush_compaction() {
+    for seed in 0..SF_FUZZ_ITERS {
+        let dir = TempDir::new().unwrap();
+        let config = make_config_single_file(dir.path());
+
+        let data = generate_seed_data(seed);
+        let mut u = Unstructured::new(&data);
+
+        let engine = Engine::open(config).unwrap();
+
+        let mut all_keys = Vec::new();
+        for _ in 0..3 {
+            let fuzz_recs = gen_records(&mut u, 10);
+            let records: Vec<Record> = fuzz_recs.iter().map(to_record).collect();
+            if records.is_empty() {
+                continue;
+            }
+            all_keys.extend(fuzz_recs.iter().map(|r| r.key.clone()));
+            engine.write_batch(&records).unwrap();
+            engine.flush().unwrap();
+        }
+
+        if all_keys.is_empty() {
+            engine.shutdown().unwrap();
+            continue;
+        }
+
+        // Trigger compaction
+        let _ = engine.trigger_compaction();
+
+        for key in &all_keys {
+            let _ = engine.query_by_prefix(key).unwrap();
         }
 
         engine.shutdown().unwrap();

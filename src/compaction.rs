@@ -5,10 +5,10 @@ use crate::manifest::{Manifest, ManifestEntry, SstInfo};
 use crate::record::{InternalRecord, Op};
 use crate::sstable::{SstReader, SstStreamWriter};
 use crate::stats::StatsCounters;
+use crate::storage::StorageBackend;
 use std::sync::Arc;
 
 pub(crate) struct CompactionRunner {
-    data_dir: std::path::PathBuf,
     block_size: usize,
     bloom_bits_per_key: usize,
     compaction_threshold: usize,
@@ -16,12 +16,12 @@ pub(crate) struct CompactionRunner {
     index: Arc<parking_lot::RwLock<BlockMetaIndex>>,
     cache: Arc<BlockCache>,
     stats: Arc<StatsCounters>,
+    storage: Arc<dyn StorageBackend>,
 }
 
 impl CompactionRunner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        data_dir: std::path::PathBuf,
         block_size: usize,
         bloom_bits_per_key: usize,
         compaction_threshold: usize,
@@ -29,9 +29,9 @@ impl CompactionRunner {
         index: Arc<parking_lot::RwLock<BlockMetaIndex>>,
         cache: Arc<BlockCache>,
         stats: Arc<StatsCounters>,
+        storage: Arc<dyn StorageBackend>,
     ) -> Self {
         Self {
-            data_dir,
             block_size,
             bloom_bits_per_key,
             compaction_threshold,
@@ -39,6 +39,7 @@ impl CompactionRunner {
             index,
             cache,
             stats,
+            storage,
         }
     }
 
@@ -53,7 +54,6 @@ impl CompactionRunner {
         }
 
         let sst_ids: Vec<u32>;
-        let sst_dir = self.data_dir.join("SST");
         {
             let mf = self.manifest.lock();
             let state = mf.state();
@@ -79,11 +79,10 @@ impl CompactionRunner {
         let mut iterators: Vec<SstBlockIterator> = Vec::new();
 
         for (idx, &sst_id) in candidates.iter().enumerate() {
-            let path = sst_dir.join(format!("{:09}.sst", sst_id));
-            if !path.exists() {
+            if !self.storage.sst_exists(sst_id) {
                 continue;
             }
-            let reader = SstReader::open(&path, sst_id, 0)?;
+            let reader = self.storage.open_reader(sst_id, 0)?;
             if reader.block_count() == 0 {
                 continue;
             }
@@ -122,10 +121,7 @@ impl CompactionRunner {
             new_sst_id = mf.next_sst_id();
         }
 
-        let sst_path = sst_dir.join(format!("{:09}.sst", new_sst_id));
-        let tmp_path = sst_path.with_extension("sst.tmp");
         let mut writer = SstStreamWriter::new(
-            &tmp_path,
             self.block_size,
             estimated_records,
             self.bloom_bits_per_key,
@@ -155,9 +151,8 @@ impl CompactionRunner {
         if records_written == 0 {
             for sst_id in &candidates {
                 self.cache.invalidate_sst(*sst_id);
-                let path = sst_dir.join(format!("{:09}.sst", sst_id));
-                if let Err(e) = std::fs::remove_file(&path) {
-                    tracing::warn!("Compaction: failed to delete SST file {:?}: {}", path, e);
+                if let Err(e) = self.storage.delete_sst(*sst_id) {
+                    tracing::warn!("Compaction: failed to delete SST {}: {}", sst_id, e);
                 }
                 let mut idx = self.index.write();
                 idx.remove_sst(*sst_id);
@@ -168,8 +163,8 @@ impl CompactionRunner {
             return Ok(true);
         }
 
-        let (sst_bytes, block_infos, bloom) = writer.finish()?;
-        std::fs::rename(&tmp_path, &sst_path)?;
+        let (data, sst_bytes, block_infos, bloom) = writer.finish()?;
+        self.storage.write_sst(new_sst_id, &data)?;
 
         let min_ts = block_infos.iter().map(|b| b.min_ts).min().unwrap_or(0);
         let max_ts = block_infos.iter().map(|b| b.max_ts).max().unwrap_or(0);
@@ -207,9 +202,8 @@ impl CompactionRunner {
 
         for sst_id in &candidates {
             self.cache.invalidate_sst(*sst_id);
-            let path = sst_dir.join(format!("{:09}.sst", sst_id));
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("Compaction: failed to delete SST file {:?}: {}", path, e);
+            if let Err(e) = self.storage.delete_sst(*sst_id) {
+                tracing::warn!("Compaction: failed to delete SST {}: {}", sst_id, e);
             }
         }
 
@@ -346,12 +340,13 @@ impl PartialOrd for HeapEntry {
 mod tests {
     use super::*;
     use crate::manifest::Manifest;
+    use crate::storage::MultiFileStorage;
     use parking_lot::RwLock;
     use tempfile::TempDir;
 
     fn make_test_runner(dir: &std::path::Path, threshold: usize) -> CompactionRunner {
+        let storage: Arc<dyn StorageBackend> = Arc::new(MultiFileStorage::new(dir));
         CompactionRunner::new(
-            dir.to_path_buf(),
             100,
             10,
             threshold,
@@ -359,6 +354,7 @@ mod tests {
             Arc::new(RwLock::new(BlockMetaIndex::new(3600))),
             Arc::new(BlockCache::new(1)),
             Arc::new(StatsCounters::new()),
+            storage,
         )
     }
 
