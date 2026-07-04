@@ -12,7 +12,7 @@
 //!   - Compound index queries ("my open todos, ordered by priority")
 //!   - Schema defined via #[derive(ObjectStore)] macro
 
-use flowdb::jsondb::{JsonDB, TransactionMode};
+use flowdb::jsondb::{JsonDB, KeyRange, TransactionMode};
 use flowdb::{Config, ObjectStore};
 use serde_json::Value;
 
@@ -84,7 +84,7 @@ impl SupaBase {
             .transaction(&["users", "sessions"], TransactionMode::ReadWrite)
             .unwrap();
 
-        tx.put(
+        tx.add(
             "users",
             serde_json::json!({
                 "id": user_id,
@@ -146,6 +146,19 @@ impl SupaBase {
             .where_eq("user_id", serde_json::json!(user_id))
             .where_eq("status", serde_json::json!("open"))
             .order_by("priority", flowdb::jsondb::SortDir::Desc)
+            .collect()
+            .unwrap()
+    }
+
+    /// Paginated open todos — limit + offset query.
+    fn my_open_todos_paginated(&self, user_id: &str, limit: usize, offset: usize) -> Vec<Value> {
+        self.db
+            .query("todos")
+            .where_eq("user_id", serde_json::json!(user_id))
+            .where_eq("status", serde_json::json!("open"))
+            .order_by("priority", flowdb::jsondb::SortDir::Desc)
+            .limit(limit)
+            .offset(offset)
             .collect()
             .unwrap()
     }
@@ -223,6 +236,19 @@ fn main() {
     // Bob tries to complete Alice's todo → rejected
     let rejected = app.complete_todo(bob["user_id"].as_str().unwrap(), todo_id);
     println!("Complete {} by other → {}", todo_id, rejected);
+
+    // ── Duplicate sign-up prevented by add() ────────────────────
+    let dup = app.sign_up("alice@ex.com", "dup");
+    println!("Duplicate sign-up prevented: {:?}", dup);
+
+    // ── Paginated todo query ───────────────────────────────────
+    for i in 0..10 {
+        app.create_todo(&uid, &format!("Task {}", i), (i % 5) + 1);
+    }
+    let page = app.my_open_todos_paginated(&uid, 3, 0);
+    println!("Paginated open todos (limit=3, offset=0): {} items", page.len());
+    let page2 = app.my_open_todos_paginated(&uid, 3, 3);
+    println!("Paginated open todos (limit=3, offset=3): {} items", page2.len());
 
     // ── Lookup by email ───────────────────────────────────────
     let user = app.get_user_by_email("bob@ex.com").unwrap();

@@ -2,9 +2,10 @@
 //!
 //! Demonstrates object stores, secondary indexes, CRUD on documents,
 //! queries with predicates, compound indexes, transactions,
-//! StoreDef builder, and the ObjectStore derive macro.
+//! StoreDef builder, ObjectStore derive macro, KeyRange, cursors,
+//! and pagination.
 
-use flowdb::jsondb::{JsonDB, SortDir, StoreSchema, TransactionMode};
+use flowdb::jsondb::{CursorDirection, JsonDB, KeyRange, SortDir, StoreSchema, TransactionMode};
 use flowdb::{Config, ObjectStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -158,6 +159,76 @@ fn main() {
     // Calling apply_store again with the same def is a no-op.
     db.apply_schema::<User>().unwrap();
     println!("apply_schema (idempotent) OK");
+
+    // ── 12. add() — insert-only, fails on duplicate ─────────────
+    db.create_object_store("tokens", "id").unwrap();
+    db.add("tokens", json!({"id": "tok1", "scope": "read"})).unwrap();
+    let err = db.add("tokens", json!({"id": "tok1", "scope": "write"})).unwrap_err();
+    println!("add duplicate rejected: {}", err);
+    // The original document is unchanged.
+    let tok = db.get("tokens", &json!("tok1")).unwrap().unwrap();
+    assert_eq!(tok["scope"], "read");
+    println!("add() works — original doc preserved");
+
+    // ── 13. clear() — remove all docs, preserve schema ──────────
+    let n = db.clear("tokens").unwrap();
+    println!("clear() removed {} docs, store still exists", n);
+    assert!(db.count("tokens").unwrap() == 0);
+    assert!(db.store_names().contains(&"tokens".to_string()));
+
+    // ── 14. getAll + KeyRange + count with query ───────────────
+    for i in 0..20u64 {
+        db.put("users", json!({"id": format!("p{}", i), "email": format!("p{}@x.com", i), "age": 20 + i})).unwrap();
+    }
+    let kr = KeyRange::bound(json!("p5"), json!("p10"), false, false);
+    let batch = db.get_all("users", Some(&kr), Some(3)).unwrap();
+    assert_eq!(batch.len(), 3);
+    let keys = db.get_all_keys("users", Some(&kr), Some(3)).unwrap();
+    println!("getAll limit=3: first {}, keys: {:?}", batch[0]["id"], keys);
+    let total = db.count_with_query("users", Some(&kr)).unwrap();
+    println!("count_with_query [p5..p10]: {}", total);
+
+    // ── 15. Pagination with QueryBuilder limit/offset ───────────
+    let page1 = db.query("users")
+        .where_eq("city", json!("NYC"))
+        .limit(2).collect().unwrap();
+    println!("QueryBuilder NYC page 1 (limit=2): {} users", page1.len());
+    let page2 = db.query("users")
+        .where_eq("city", json!("NYC"))
+        .limit(2).offset(2).collect().unwrap();
+    println!("QueryBuilder NYC page 2 (offset=2): {} users", page2.len());
+
+    // ── 16. Cursor ──────────────────────────────────────────────
+    let mut cursor = db
+        .open_cursor("users", None, CursorDirection::Next)
+        .unwrap();
+    let mut count = 0;
+    while let Some((key, doc)) = cursor.next_value() {
+        if count == 0 {
+            println!("Cursor first: key={:#?} doc={:#?}", key, doc);
+        }
+        count += 1;
+    }
+    println!("Cursor iterated {} users", count);
+
+    // ── 17. Index cursor ────────────────────────────────────────
+    let mut icursor = db
+        .open_cursor_on_index("users", "by_email", None, CursorDirection::Prev)
+        .unwrap();
+    let (idx_val, pk, doc) = icursor.next_value().unwrap();
+    println!("Index cursor (prev, first): idx={:#?} pk={:#?}", idx_val, pk);
+
+    // ── 18. Transaction add / clear ─────────────────────────────
+    let mut tx = db.transaction(&["users"], TransactionMode::ReadWrite).unwrap();
+    tx.add("users", json!({"id": "tx_new", "email": "tx@x.com", "age": 99})).unwrap();
+    let before = tx.count("users").unwrap();
+    tx.clear("users").unwrap();
+    tx.commit().unwrap();
+    println!("tx.add then tx.clear: count before={}, after={}", before, db.count("users").unwrap());
+
+    // ── 19. delete_index ────────────────────────────────────────
+    db.delete_index("users", "by_age").unwrap();
+    println!("delete_index(users, by_age) OK");
 
     db.shutdown().unwrap();
     println!("Done (data in {})", dir.path().display());
