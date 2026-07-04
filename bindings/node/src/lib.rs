@@ -35,6 +35,25 @@ fn value_opt_to_js(env: &Env, val: Option<Value>) -> Result<JsUnknown> {
     }
 }
 
+fn inject_meta(doc: Value, ts: i64, expire_at: i64) -> Value {
+    match doc {
+        Value::Object(mut map) => {
+            // Timestamps are in microseconds. Convert to milliseconds for
+            // JS Number compatibility (microsecond epoch fits in i64 but
+            // may exceed Number.MAX_SAFE_INTEGER in the JS runtime).
+            map.insert("_tsMs".to_string(), Value::from(ts / 1000));
+            // i64::MAX means "never expires".
+            if expire_at == i64::MAX {
+                map.insert("_expireAtMs".to_string(), Value::Null);
+            } else {
+                map.insert("_expireAtMs".to_string(), Value::from(expire_at / 1000));
+            }
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
 fn values_to_js_vec(env: &Env, vals: Vec<Value>) -> Result<Vec<JsUnknown>> {
     vals.into_iter()
         .map(|v| value_to_js(env, v))
@@ -210,6 +229,15 @@ impl FlowDb {
             key,
         })
     }
+
+    #[napi]
+    pub fn get_with_meta(&self, store: String, key: Value) -> AsyncTask<GetWithMetaTask> {
+        AsyncTask::new(GetWithMetaTask {
+            inner: self.inner.clone(),
+            store,
+            key,
+        })
+    }
 }
 
 pub struct GetTask {
@@ -225,6 +253,29 @@ impl Task for GetTask {
     fn compute(&mut self) -> Result<Self::Output> {
         let key = std::mem::take(&mut self.key);
         self.inner.get(&self.store, &key).map_err(flow_err)
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        value_opt_to_js(&env, output)
+    }
+}
+
+pub struct GetWithMetaTask {
+    inner: Arc<JsonDB>,
+    store: String,
+    key: Value,
+}
+
+impl Task for GetWithMetaTask {
+    type Output = Option<Value>;
+    type JsValue = JsUnknown;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let key = std::mem::take(&mut self.key);
+        let result = self.inner.get_with_meta(&self.store, &key).map_err(flow_err)?;
+        Ok(result.map(|(doc, ts, expire_at)| {
+            inject_meta(doc, ts, expire_at)
+        }))
     }
 
     fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -277,6 +328,14 @@ impl FlowDb {
             store,
         })
     }
+
+    #[napi]
+    pub fn scan_with_meta(&self, store: String) -> AsyncTask<ScanWithMetaTask> {
+        AsyncTask::new(ScanWithMetaTask {
+            inner: self.inner.clone(),
+            store,
+        })
+    }
 }
 
 pub struct ScanTask {
@@ -290,6 +349,25 @@ impl Task for ScanTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         self.inner.scan(&self.store).map_err(flow_err)
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        values_to_js_vec(&env, output)
+    }
+}
+
+pub struct ScanWithMetaTask {
+    inner: Arc<JsonDB>,
+    store: String,
+}
+
+impl Task for ScanWithMetaTask {
+    type Output = Vec<Value>;
+    type JsValue = Vec<JsUnknown>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let docs = self.inner.scan_with_meta(&self.store).map_err(flow_err)?;
+        Ok(docs.into_iter().map(|(doc, ts, expire_at)| inject_meta(doc, ts, expire_at)).collect())
     }
 
     fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -316,11 +394,13 @@ impl FlowDb {
         &self,
         name: String,
         key_path: String,
+        auto_increment: bool,
     ) -> AsyncTask<CreateObjectStoreTask> {
         AsyncTask::new(CreateObjectStoreTask {
             inner: self.inner.clone(),
             name,
             key_path,
+            auto_increment,
         })
     }
 }
@@ -329,6 +409,7 @@ pub struct CreateObjectStoreTask {
     inner: Arc<JsonDB>,
     name: String,
     key_path: String,
+    auto_increment: bool,
 }
 
 impl Task for CreateObjectStoreTask {
@@ -336,9 +417,16 @@ impl Task for CreateObjectStoreTask {
     type JsValue = ();
 
     fn compute(&mut self) -> Result<Self::Output> {
-        self.inner
-            .create_object_store(&self.name, &self.key_path)
-            .map_err(flow_err)
+        if self.auto_increment {
+            let def = flowdb::jsondb::StoreSchema::new(&self.name, &self.key_path)
+                .with_auto_increment();
+            self.inner.apply_store(&def).map_err(flow_err)?;
+        } else {
+            self.inner
+                .create_object_store(&self.name, &self.key_path)
+                .map_err(flow_err)?;
+        }
+        Ok(())
     }
 
     fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
@@ -602,6 +690,7 @@ impl FlowDb {
 
 enum TxOp {
     Put { store: String, value: Value },
+    PutAuto { store: String, value: Value },
     Delete { store: String, key: Value },
 }
 
@@ -625,12 +714,78 @@ impl JsTransaction {
     }
 
     #[napi]
+    pub fn put_auto(&self, store: String, value: Value) -> Result<()> {
+        self.ops
+            .lock()
+            .map_err(|_| napi::Error::from_reason("transaction lock poisoned"))?
+            .push(TxOp::PutAuto { store, value });
+        Ok(())
+    }
+
+    #[napi]
     pub fn delete(&self, store: String, key: Value) -> Result<()> {
         self.ops
             .lock()
             .map_err(|_| napi::Error::from_reason("transaction lock poisoned"))?
             .push(TxOp::Delete { store, key });
         Ok(())
+    }
+
+    #[napi]
+    pub fn get(&self, store: String, key: Value) -> AsyncTask<GetTask> {
+        AsyncTask::new(GetTask {
+            inner: self.db.clone(),
+            store,
+            key,
+        })
+    }
+
+    #[napi]
+    pub fn count(&self, store: String) -> AsyncTask<CountTask> {
+        AsyncTask::new(CountTask {
+            inner: self.db.clone(),
+            store,
+        })
+    }
+
+    #[napi]
+    pub fn scan(&self, store: String) -> AsyncTask<ScanTask> {
+        AsyncTask::new(ScanTask {
+            inner: self.db.clone(),
+            store,
+        })
+    }
+
+    #[napi]
+    pub fn get_by_index(
+        &self,
+        store: String,
+        index: String,
+        value: Value,
+    ) -> AsyncTask<GetByIndexTask> {
+        AsyncTask::new(GetByIndexTask {
+            inner: self.db.clone(),
+            store,
+            index,
+            value,
+        })
+    }
+
+    #[napi]
+    pub fn range_by_index(
+        &self,
+        store: String,
+        index: String,
+        start: Value,
+        end: Value,
+    ) -> AsyncTask<RangeByIndexTask> {
+        AsyncTask::new(RangeByIndexTask {
+            inner: self.db.clone(),
+            store,
+            index,
+            start,
+            end,
+        })
     }
 
     #[napi]
@@ -683,6 +838,9 @@ impl Task for CommitTask {
             match op {
                 TxOp::Put { store, value } => {
                     tx.put(&store, value).map_err(flow_err)?;
+                }
+                TxOp::PutAuto { store, value } => {
+                    tx.put_auto(&store, value).map_err(flow_err)?;
                 }
                 TxOp::Delete { store, key } => {
                     tx.delete(&store, &key).map_err(flow_err)?;

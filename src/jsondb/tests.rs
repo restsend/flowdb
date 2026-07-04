@@ -8,6 +8,7 @@ mod tests {
     use crate::jsondb::schema::*;
 
     use crate::jsondb::{JsonDB, SortDir, TransactionMode};
+    use crate::jsondb::StoreSchema;
 
     use crate::record::InternalRecord;
     use serde_json::{Value, json};
@@ -278,6 +279,58 @@ mod tests {
         assert_eq!(doc1["type"], "click");
         let doc3 = db.get("events", &json!(3)).unwrap().unwrap();
         assert_eq!(doc3["type"], "nav");
+    }
+
+    #[test]
+    fn test_get_with_meta() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1", "name": "Alice"}))
+            .unwrap();
+
+        // get_with_meta returns (doc, ts, expire_at).
+        let result = db.get_with_meta("users", &json!("u1")).unwrap();
+        assert!(result.is_some());
+        let (doc, ts, expire_at) = result.unwrap();
+        assert_eq!(doc["name"], "Alice");
+        assert!(ts >= 0, "ts should be non-negative");
+        assert_eq!(expire_at, i64::MAX, "default expire_at should be i64::MAX");
+
+        // Non-existent key returns None.
+        let missing = db.get_with_meta("users", &json!("nope")).unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_scan_with_meta() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1", "name": "Alice"}))
+            .unwrap();
+        db.put("users", json!({"id": "u2", "name": "Bob"}))
+            .unwrap();
+
+        let docs = db.scan_with_meta("users").unwrap();
+        assert_eq!(docs.len(), 2);
+        for (doc, ts, expire_at) in &docs {
+            assert!(doc["name"].is_string());
+            assert!(*ts >= 0);
+            assert_eq!(*expire_at, i64::MAX);
+        }
+    }
+
+    #[test]
+    fn test_apply_store_auto_increment() {
+        let (db, _dir) = test_db();
+        // Use apply_store with with_auto_increment — should work in one shot.
+        let def = StoreSchema::new("events", "id").with_auto_increment();
+        db.apply_store(&def).unwrap();
+
+        // put_auto should work immediately.
+        let id1 = db.put_auto("events", json!({"type": "click"})).unwrap();
+        assert_eq!(id1, json!(1));
+        let id2 = db.put_auto("events", json!({"type": "scroll"})).unwrap();
+        assert_eq!(id2, json!(2));
     }
 
     // ── explicit transactions ─────────────────────────────────────

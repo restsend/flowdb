@@ -51,6 +51,9 @@ const db = FlowDB.open({
 // Create an object store (like an IndexedDB object store)
 await db.createObjectStore('users', 'email')
 
+// Or create an auto-increment store (for putAuto)
+await db.createObjectStore('events', '_id', true)
+
 // Insert documents
 await db.put('users', { email: 'alice@example.com', name: 'Alice', age: 30 })
 await db.put('users', { email: 'bob@example.com', name: 'Bob', age: 25 })

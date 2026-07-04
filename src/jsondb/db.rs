@@ -464,6 +464,23 @@ impl JsonDB {
         }
     }
 
+    /// Retrieve a document by primary key, including its internal timestamp
+    /// (`ts`) and expiry (`expire_at`) in microseconds since epoch.
+    ///
+    /// Returns `None` if the document does not exist.
+    pub fn get_with_meta(&self, store: &str, key: &Value) -> Result<Option<(Value, i64, i64)>> {
+        let _def = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+        let key_bytes = encode_primary_key(key)?;
+        let rec = self.engine.get_bytes(&doc_key(store, &key_bytes), 0);
+        match rec {
+            Some(r) => Ok(Some((decode_doc(&r.value)?, r.ts, r.expire_at))),
+            None => Ok(None),
+        }
+    }
+
     /// Delete a document by primary key (and all associated index entries).
     pub fn delete(&self, store: &str, key: &Value) -> Result<()> {
         let _lock = self.write_lock.lock().unwrap();
@@ -538,6 +555,25 @@ impl JsonDB {
         for r in iter {
             let rec = r?;
             docs.push(decode_doc(&rec.value)?);
+        }
+        Ok(docs)
+    }
+
+    /// Retrieve all documents in a store, including internal timestamps
+    /// (`ts`, `expire_at`) for each document.
+    ///
+    /// Returns a vector of `(document, ts, expire_at)` tuples.
+    pub fn scan_with_meta(&self, store: &str) -> Result<Vec<(Value, i64, i64)>> {
+        let _ = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+        let pfx = doc_prefix(store);
+        let iter = self.engine.scan(prefix_range(&pfx))?;
+        let mut docs = Vec::new();
+        for r in iter {
+            let rec = r?;
+            docs.push((decode_doc(&rec.value)?, rec.ts, rec.expire_at));
         }
         Ok(docs)
     }

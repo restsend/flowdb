@@ -51,8 +51,32 @@ class Transaction {
     this._tx.put(store, value)
   }
 
+  putAuto(store, value) {
+    this._tx.putAuto(store, value)
+  }
+
   delete(store, key) {
     this._tx.delete(store, key)
+  }
+
+  async get(store, key) {
+    return this._tx.get(store, key)
+  }
+
+  async count(store) {
+    return this._tx.count(store)
+  }
+
+  async scan(store) {
+    return this._tx.scan(store)
+  }
+
+  async getByIndex(store, index, value) {
+    return this._tx.getByIndex(store, index, value)
+  }
+
+  async rangeByIndex(store, index, start, end) {
+    return this._tx.rangeByIndex(store, index, start, end)
   }
 
   async commit() {
@@ -90,14 +114,18 @@ class FlowDB {
 
   async get(store, key) { return this._db.get(store, key) }
 
-  async delete(store, key) { await this._db.delete(store, key) }
+  async getWithMeta(store, key) { return this._db.getWithMeta(store, key) }
+
+  async delete(store, key) { return this._db.delete(store, key) }
 
   async putAuto(store, value) { return this._db.putAuto(store, value) }
 
   async scan(store) { return this._db.scan(store) }
 
-  async createObjectStore(name, keyPath) {
-    await this._db.createObjectStore(name, keyPath)
+  async scanWithMeta(store) { return this._db.scanWithMeta(store) }
+
+  async createObjectStore(name, keyPath, autoIncrement) {
+    await this._db.createObjectStore(name, keyPath, autoIncrement || false)
   }
 
   async deleteObjectStore(name) {
