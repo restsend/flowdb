@@ -87,6 +87,67 @@ impl<'db> Transaction<'db> {
         Ok(key_val)
     }
 
+    /// Insert a document only if the key does not already exist
+    /// (IndexedDB `add` semantics). Returns an error if the key exists.
+    pub fn add(&mut self, store: &str, doc: Value) -> Result<Value> {
+        self.require_read_write()?;
+        let def = self.require_store(store)?;
+        let key_val = extract_field(&doc, &def.key_path).ok_or_else(|| {
+            FlowError::JsonDb(format!(
+                "document missing key_path '{}' for store '{}'",
+                def.key_path, store
+            ))
+        })?;
+        let key_bytes = encode_primary_key(&key_val)?;
+
+        // Check write buffer.
+        if let Some(doc_opt) = self.writes.get(&(store.to_string(), key_bytes.clone())) {
+            if doc_opt.is_some() {
+                return Err(FlowError::JsonDb(format!(
+                    "key already exists in store '{}'",
+                    store
+                )));
+            }
+        } else if self.db.engine.get_bytes(&doc_key(store, &key_bytes), 0).is_some() {
+            return Err(FlowError::JsonDb(format!(
+                "key already exists in store '{}'",
+                store
+            )));
+        }
+
+        let doc_bytes = encode_doc(&doc)?;
+        self.writes
+            .insert((store.to_string(), key_bytes), Some(doc_bytes));
+        Ok(key_val)
+    }
+
+    /// Remove all documents from a store within this transaction.
+    pub fn clear(&mut self, store: &str) -> Result<()> {
+        self.require_read_write()?;
+        let def = self.require_store(store)?;
+
+        // Scan existing keys and mark each as deleted in the write buffer.
+        let pfx = doc_prefix(store);
+        let iter = self.db.engine.scan(prefix_range(&pfx))?;
+        for r in iter {
+            let rec = r?;
+            let key_bytes = rec.key[pfx.len()..].to_vec();
+            self.writes.insert((store.to_string(), key_bytes), None);
+        }
+        // Also mark any buffered puts as deleted.
+        let _ = def;
+        let keys_to_delete: Vec<Vec<u8>> = self
+            .writes
+            .iter()
+            .filter(|((s, _), opt)| s == store && opt.is_some())
+            .map(|((_, k), _)| k.clone())
+            .collect();
+        for k in keys_to_delete {
+            self.writes.insert((store.to_string(), k), None);
+        }
+        Ok(())
+    }
+
     /// Retrieve a document by primary key.
     ///
     /// Reads from the transaction's write buffer first (read-your-writes),

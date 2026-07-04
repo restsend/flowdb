@@ -66,8 +66,8 @@ fn main() {
 
     // ── 1. Old-style API (still works) ────────────────────────────
     // db.create_object_store("users", "id").unwrap();
-    // db.create_index("users", "by_email", &["email"], true).unwrap();
-    // db.create_index("users", "by_city_age", &["city", "age"], false).unwrap();
+    // db.create_index("users", "by_email", &["email"], true, false).unwrap();
+    // db.create_index("users", "by_city_age", &["city", "age"], false, false).unwrap();
 
     // ── 2. Insert documents ───────────────────────────────────────
     let docs = vec![
@@ -100,7 +100,7 @@ fn main() {
     // ── 5. Compound index query (index created manually below) ───
     // Note: the derive macro only created a single-field "age" index,
     // not a compound index.  Let's add one via the classic API:
-    db.create_index("users", "by_city_age", &["city", "age"], false)
+    db.create_index("users", "by_city_age", &["city", "age"], false, false)
         .unwrap();
     let results = db
         .query("users")

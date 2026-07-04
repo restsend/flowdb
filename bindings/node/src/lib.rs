@@ -1,4 +1,5 @@
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::JsUnknown;
 use napi_derive::napi;
 use std::sync::Arc;
@@ -58,6 +59,33 @@ fn values_to_js_vec(env: &Env, vals: Vec<Value>) -> Result<Vec<JsUnknown>> {
     vals.into_iter()
         .map(|v| value_to_js(env, v))
         .collect()
+}
+
+fn parse_key_range(val: &Option<Value>) -> Result<Option<flowdb::jsondb::KeyRange>> {
+    match val {
+        None => Ok(None),
+        Some(v) => {
+            let obj = v.as_object().ok_or_else(|| {
+                napi::Error::from_reason("KeyRange must be an object")
+            })?;
+            let lower = obj.get("lower").filter(|v| !v.is_null()).cloned();
+            let upper = obj.get("upper").filter(|v| !v.is_null()).cloned();
+            let lower_open = obj
+                .get("lowerOpen")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let upper_open = obj
+                .get("upperOpen")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Ok(Some(flowdb::jsondb::KeyRange {
+                lower,
+                upper,
+                lower_open,
+                upper_open,
+            }))
+        }
+    }
 }
 
 // ── JsConfig ────────────────────────────────────────────────────────
@@ -476,6 +504,7 @@ impl FlowDb {
         name: String,
         key_paths: Vec<String>,
         unique: Option<bool>,
+        multi_entry: Option<bool>,
     ) -> AsyncTask<CreateIndexTask> {
         AsyncTask::new(CreateIndexTask {
             inner: self.inner.clone(),
@@ -483,6 +512,7 @@ impl FlowDb {
             name,
             key_paths,
             unique: unique.unwrap_or(false),
+            multi_entry: multi_entry.unwrap_or(false),
         })
     }
 }
@@ -493,6 +523,7 @@ pub struct CreateIndexTask {
     name: String,
     key_paths: Vec<String>,
     unique: bool,
+    multi_entry: bool,
 }
 
 impl Task for CreateIndexTask {
@@ -502,7 +533,13 @@ impl Task for CreateIndexTask {
     fn compute(&mut self) -> Result<Self::Output> {
         let refs: Vec<&str> = self.key_paths.iter().map(|s| s.as_str()).collect();
         self.inner
-            .create_index(&self.store, &self.name, &refs, self.unique)
+            .create_index(
+                &self.store,
+                &self.name,
+                &refs,
+                self.unique,
+                self.multi_entry,
+            )
             .map_err(flow_err)
     }
 
@@ -667,6 +704,377 @@ impl Task for RangeByIndexTask {
 
     fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
         values_to_js_vec(&env, output)
+    }
+}
+
+// ── AddTask (IndexedDB add — fail on duplicate key) ─────────────────
+
+#[napi]
+impl FlowDb {
+    #[napi]
+    pub fn add(&self, store: String, value: Value) -> AsyncTask<AddTask> {
+        AsyncTask::new(AddTask {
+            inner: self.inner.clone(),
+            store,
+            value,
+        })
+    }
+}
+
+pub struct AddTask {
+    inner: Arc<JsonDB>,
+    store: String,
+    value: Value,
+}
+
+impl Task for AddTask {
+    type Output = Value;
+    type JsValue = JsUnknown;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let value = std::mem::take(&mut self.value);
+        self.inner.add(&self.store, value).map_err(flow_err)
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        value_to_js(&env, output)
+    }
+}
+
+// ── ClearTask ───────────────────────────────────────────────────────
+
+#[napi]
+impl FlowDb {
+    #[napi]
+    pub fn clear(&self, store: String) -> AsyncTask<ClearTask> {
+        AsyncTask::new(ClearTask {
+            inner: self.inner.clone(),
+            store,
+        })
+    }
+}
+
+pub struct ClearTask {
+    inner: Arc<JsonDB>,
+    store: String,
+}
+
+impl Task for ClearTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.inner.clear(&self.store).map_err(flow_err)?;
+        Ok(())
+    }
+
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
+    }
+}
+
+// ── GetAllTask (IndexedDB getAll with optional KeyRange + count) ────
+
+#[napi]
+impl FlowDb {
+    #[napi]
+    pub fn get_all(
+        &self,
+        store: String,
+        query: Option<Value>,
+        count: Option<i64>,
+    ) -> AsyncTask<GetAllTask> {
+        AsyncTask::new(GetAllTask {
+            inner: self.inner.clone(),
+            store,
+            query,
+            count: count.map(|c| c as usize),
+        })
+    }
+}
+
+pub struct GetAllTask {
+    inner: Arc<JsonDB>,
+    store: String,
+    query: Option<Value>,
+    count: Option<usize>,
+}
+
+impl Task for GetAllTask {
+    type Output = Vec<Value>;
+    type JsValue = Vec<JsUnknown>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let kr = parse_key_range(&self.query)?;
+        self.inner
+            .get_all(&self.store, kr.as_ref(), self.count)
+            .map_err(flow_err)
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        values_to_js_vec(&env, output)
+    }
+}
+
+// ── GetAllKeysTask ──────────────────────────────────────────────────
+
+#[napi]
+impl FlowDb {
+    #[napi]
+    pub fn get_all_keys(
+        &self,
+        store: String,
+        query: Option<Value>,
+        count: Option<i64>,
+    ) -> AsyncTask<GetAllKeysTask> {
+        AsyncTask::new(GetAllKeysTask {
+            inner: self.inner.clone(),
+            store,
+            query,
+            count: count.map(|c| c as usize),
+        })
+    }
+}
+
+pub struct GetAllKeysTask {
+    inner: Arc<JsonDB>,
+    store: String,
+    query: Option<Value>,
+    count: Option<usize>,
+}
+
+impl Task for GetAllKeysTask {
+    type Output = Vec<Value>;
+    type JsValue = Vec<JsUnknown>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let kr = parse_key_range(&self.query)?;
+        self.inner
+            .get_all_keys(&self.store, kr.as_ref(), self.count)
+            .map_err(flow_err)
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        values_to_js_vec(&env, output)
+    }
+}
+
+// ── GetKeyTask ──────────────────────────────────────────────────────
+
+#[napi]
+impl FlowDb {
+    #[napi]
+    pub fn get_key(&self, store: String, key: Value) -> AsyncTask<GetKeyTask> {
+        AsyncTask::new(GetKeyTask {
+            inner: self.inner.clone(),
+            store,
+            key,
+        })
+    }
+}
+
+pub struct GetKeyTask {
+    inner: Arc<JsonDB>,
+    store: String,
+    key: Value,
+}
+
+impl Task for GetKeyTask {
+    type Output = Option<Value>;
+    type JsValue = JsUnknown;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let key = std::mem::take(&mut self.key);
+        self.inner.get_key(&self.store, &key).map_err(flow_err)
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        value_opt_to_js(&env, output)
+    }
+}
+
+// ── CountQueryTask ──────────────────────────────────────────────────
+
+#[napi]
+impl FlowDb {
+    #[napi]
+    pub fn count_query(
+        &self,
+        store: String,
+        query: Option<Value>,
+    ) -> AsyncTask<CountQueryTask> {
+        AsyncTask::new(CountQueryTask {
+            inner: self.inner.clone(),
+            store,
+            query,
+        })
+    }
+}
+
+pub struct CountQueryTask {
+    inner: Arc<JsonDB>,
+    store: String,
+    query: Option<Value>,
+}
+
+impl Task for CountQueryTask {
+    type Output = usize;
+    type JsValue = i64;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let kr = parse_key_range(&self.query)?;
+        self.inner
+            .count_with_query(&self.store, kr.as_ref())
+            .map_err(flow_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output as i64)
+    }
+}
+
+// ── Cursor (callback-style + async iterator) ────────────────────────
+
+#[napi]
+impl FlowDb {
+    /// Open a cursor over a store and call `callback` for each item.
+    /// The callback receives `{ key, value }` or `null` when done.
+    /// Return `true` to continue, `false` to stop.
+    #[napi]
+    pub fn open_cursor(
+        &self,
+        store: String,
+        query: Option<Value>,
+        direction: String,
+        callback: ThreadsafeFunction<CursorItem, ErrorStrategy::Fatal>,
+    ) -> AsyncTask<OpenCursorTask> {
+        AsyncTask::new(OpenCursorTask {
+            inner: self.inner.clone(),
+            store,
+            query,
+            direction,
+            callback,
+            is_index: false,
+            index: None,
+        })
+    }
+
+    /// Open a cursor over an index and call `callback` for each item.
+    /// The callback receives `{ key, primaryKey, value }` or `null` when done.
+    #[napi]
+    pub fn open_cursor_by_index(
+        &self,
+        store: String,
+        index: String,
+        query: Option<Value>,
+        direction: String,
+        callback: ThreadsafeFunction<CursorItem, ErrorStrategy::Fatal>,
+    ) -> AsyncTask<OpenCursorTask> {
+        AsyncTask::new(OpenCursorTask {
+            inner: self.inner.clone(),
+            store,
+            query,
+            direction,
+            callback,
+            is_index: true,
+            index: Some(index),
+        })
+    }
+}
+
+#[napi(object)]
+pub struct CursorItem {
+    pub key: Value,
+    pub primary_key: Option<Value>,
+    pub value: Value,
+    pub done: bool,
+}
+
+pub struct OpenCursorTask {
+    inner: Arc<JsonDB>,
+    store: String,
+    query: Option<Value>,
+    direction: String,
+    callback: ThreadsafeFunction<CursorItem, ErrorStrategy::Fatal>,
+    is_index: bool,
+    index: Option<String>,
+}
+
+impl Task for OpenCursorTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let kr = parse_key_range(&self.query)?;
+        let dir = flowdb::jsondb::CursorDirection::parse(&self.direction)
+            .map_err(flow_err)?;
+
+        if self.is_index {
+            let index = self.index.as_ref().unwrap();
+            let mut cursor = self
+                .inner
+                .open_cursor_on_index(&self.store, index, kr.as_ref(), dir)
+                .map_err(flow_err)?;
+            while let Some((idx_key, pk, doc)) = cursor.next_value() {
+                let item = CursorItem {
+                    key: idx_key,
+                    primary_key: Some(pk),
+                    value: doc,
+                    done: false,
+                };
+                let status = self.callback.call(
+                    item,
+                    ThreadsafeFunctionCallMode::Blocking,
+                );
+                if status != napi::Status::Ok {
+                    break;
+                }
+            }
+            // Signal done.
+            let _ = self.callback.call(
+                CursorItem {
+                    key: Value::Null,
+                    primary_key: None,
+                    value: Value::Null,
+                    done: true,
+                },
+                ThreadsafeFunctionCallMode::Blocking,
+            );
+        } else {
+            let mut cursor = self
+                .inner
+                .open_cursor(&self.store, kr.as_ref(), dir)
+                .map_err(flow_err)?;
+            while let Some((key, doc)) = cursor.next_value() {
+                let item = CursorItem {
+                    key,
+                    primary_key: None,
+                    value: doc,
+                    done: false,
+                };
+                let status = self.callback.call(
+                    item,
+                    ThreadsafeFunctionCallMode::Blocking,
+                );
+                if status != napi::Status::Ok {
+                    break;
+                }
+            }
+            let _ = self.callback.call(
+                CursorItem {
+                    key: Value::Null,
+                    primary_key: None,
+                    value: Value::Null,
+                    done: true,
+                },
+                ThreadsafeFunctionCallMode::Blocking,
+            );
+        }
+        Ok(())
+    }
+
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        Ok(())
     }
 }
 

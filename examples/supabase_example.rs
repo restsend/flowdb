@@ -66,8 +66,8 @@ impl SupaBase {
         db.apply_schema::<TodoStore>().unwrap();
 
         // Compound indexes not expressible via single-field #[index]:
-        db.create_index("todos", "by_user_status", &["user_id", "status"], false).unwrap();
-        db.create_index("todos", "by_user_priority", &["user_id", "priority"], false).unwrap();
+        db.create_index("todos", "by_user_status", &["user_id", "status"], false, false).unwrap();
+        db.create_index("todos", "by_user_priority", &["user_id", "priority"], false, false).unwrap();
 
         Self { db }
     }

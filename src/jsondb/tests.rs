@@ -7,7 +7,7 @@ mod tests {
     use crate::jsondb::encoding::*;
     use crate::jsondb::schema::*;
 
-    use crate::jsondb::{JsonDB, SortDir, TransactionMode};
+    use crate::jsondb::{CursorDirection, JsonDB, KeyRange, SortDir, TransactionMode};
     use crate::jsondb::StoreSchema;
 
     use crate::record::InternalRecord;
@@ -28,9 +28,9 @@ mod tests {
 
     pub(crate) fn setup_users(db: &JsonDB) {
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
-        db.create_index("users", "by_age", &["age"], false).unwrap();
+        db.create_index("users", "by_age", &["age"], false, false).unwrap();
     }
 
     // ── basic CRUD ────────────────────────────────────────────────
@@ -242,7 +242,7 @@ mod tests {
             .unwrap();
 
         // Now create the index.
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
 
         // Should be able to query by index.
@@ -418,7 +418,7 @@ mod tests {
     fn test_transaction_atomicity() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
 
         // This will fail because u1 already exists.
@@ -479,7 +479,7 @@ mod tests {
     fn test_create_delete_index() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
 
         let def = db.get_store("users").unwrap();
@@ -549,7 +549,7 @@ mod tests {
             };
             let db = JsonDB::open(cfg).unwrap();
             db.create_object_store("users", "id").unwrap();
-            db.create_index("users", "by_email", &["email"], true)
+            db.create_index("users", "by_email", &["email"], true, false)
                 .unwrap();
             db.put("users", json!({"id": "u1", "email": "a@b.com"}))
                 .unwrap();
@@ -728,10 +728,10 @@ mod tests {
     fn test_create_index_duplicate() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
         let err = db
-            .create_index("users", "by_email", &["phone"], true)
+            .create_index("users", "by_email", &["phone"], true, false)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
@@ -740,7 +740,7 @@ mod tests {
     fn test_create_index_missing_store() {
         let (db, _dir) = test_db();
         let err = db
-            .create_index("nonexistent", "idx", &["field"], false)
+            .create_index("nonexistent", "idx", &["field"], false, false)
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
@@ -1010,7 +1010,7 @@ mod tests {
     fn test_index_on_nested_field() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_city", &["address.city"], false)
+        db.create_index("users", "by_city", &["address.city"], false, false)
             .unwrap();
         db.put("users", json!({"id": "u1", "address": {"city": "NYC"}}))
             .unwrap();
@@ -1026,7 +1026,7 @@ mod tests {
     fn test_index_on_field_not_present() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], false)
+        db.create_index("users", "by_email", &["email"], false, false)
             .unwrap();
         // Doc without the indexed field
         db.put("users", json!({"id": "u1"})).unwrap();
@@ -1039,7 +1039,7 @@ mod tests {
     fn test_index_float_values() {
         let (db, _dir) = test_db();
         db.create_object_store("scores", "id").unwrap();
-        db.create_index("scores", "by_score", &["score"], false)
+        db.create_index("scores", "by_score", &["score"], false, false)
             .unwrap();
 
         db.put("scores", json!({"id": "a", "score": 95.5})).unwrap();
@@ -1060,7 +1060,7 @@ mod tests {
     fn test_index_bool_values() {
         let (db, _dir) = test_db();
         db.create_object_store("items", "id").unwrap();
-        db.create_index("items", "by_active", &["active"], false)
+        db.create_index("items", "by_active", &["active"], false, false)
             .unwrap();
 
         db.put("items", json!({"id": 1, "active": true})).unwrap();
@@ -1081,7 +1081,7 @@ mod tests {
     fn test_index_null_values() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], false)
+        db.create_index("users", "by_email", &["email"], false, false)
             .unwrap();
 
         db.put("users", json!({"id": "u1", "email": null})).unwrap();
@@ -1099,7 +1099,7 @@ mod tests {
     fn test_many_documents() {
         let (db, _dir) = test_db();
         db.create_object_store("large", "id").unwrap();
-        db.create_index("large", "by_val", &["val"], false).unwrap();
+        db.create_index("large", "by_val", &["val"], false, false).unwrap();
 
         let n = 200;
         for i in 0..n {
@@ -1129,7 +1129,7 @@ mod tests {
         let (db, _dir) = test_db();
         db.create_object_store("a", "id").unwrap();
         db.create_object_store("b", "id").unwrap();
-        db.create_index("a", "by_val", &["val"], false).unwrap();
+        db.create_index("a", "by_val", &["val"], false, false).unwrap();
 
         db.put("a", json!({"id": "a1", "val": 1})).unwrap();
         db.put("b", json!({"id": "b1", "val": 2})).unwrap();
@@ -1230,7 +1230,7 @@ mod tests {
 
         // Creating a unique index on existing data with duplicates succeeds
         // but subsequent put attempts will fail with unique violation.
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
 
         let err = db
@@ -1425,7 +1425,7 @@ mod tests {
             };
             let db = JsonDB::open(cfg).unwrap();
             db.create_object_store("users", "id").unwrap();
-            db.create_index("users", "by_name", &["name"], false)
+            db.create_index("users", "by_name", &["name"], false, false)
                 .unwrap();
             db.put("users", json!({"id": "u1", "name": "Alice"}))
                 .unwrap();
@@ -1464,7 +1464,7 @@ mod tests {
             };
             let db = JsonDB::open(cfg).unwrap();
             db.create_object_store("store", "id").unwrap();
-            db.create_index("store", "by_val", &["val"], true).unwrap();
+            db.create_index("store", "by_val", &["val"], true, false).unwrap();
             for i in 0u64..20 {
                 db.put("store", json!({"id": i, "val": format!("v{}", i)}))
                     .unwrap();
@@ -1497,7 +1497,7 @@ mod tests {
     fn test_throughput_sequential_writes() {
         let (db, _dir) = test_db();
         db.create_object_store("bench", "id").unwrap();
-        db.create_index("bench", "by_val", &["val"], false).unwrap();
+        db.create_index("bench", "by_val", &["val"], false, false).unwrap();
 
         let n = 1_000;
         let start = std::time::Instant::now();
@@ -1519,7 +1519,7 @@ mod tests {
     fn test_throughput_point_reads() {
         let (db, _dir) = test_db();
         db.create_object_store("bench", "id").unwrap();
-        db.create_index("bench", "by_val", &["val"], false).unwrap();
+        db.create_index("bench", "by_val", &["val"], false, false).unwrap();
 
         let n = 1_000;
         for i in 0u64..n {
@@ -1544,7 +1544,7 @@ mod tests {
     fn test_throughput_index_query() {
         let (db, _dir) = test_db();
         db.create_object_store("bench", "id").unwrap();
-        db.create_index("bench", "by_val", &["val"], false).unwrap();
+        db.create_index("bench", "by_val", &["val"], false, false).unwrap();
 
         let n = 1_000;
         for i in 0u64..n {
@@ -1634,7 +1634,7 @@ mod tests {
     fn test_composite_index_equality() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_city_age", &["city", "age"], false)
+        db.create_index("users", "by_city_age", &["city", "age"], false, false)
             .unwrap();
 
         db.put("users", json!({"id": "u1", "city": "NYC", "age": 30}))
@@ -1662,7 +1662,7 @@ mod tests {
     fn test_composite_index_update() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_city_age", &["city", "age"], true)
+        db.create_index("users", "by_city_age", &["city", "age"], true, false)
             .unwrap();
 
         db.put("users", json!({"id": "u1", "city": "NYC", "age": 30}))
@@ -1687,7 +1687,7 @@ mod tests {
     fn test_composite_index_unique() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_city_age", &["city", "age"], true)
+        db.create_index("users", "by_city_age", &["city", "age"], true, false)
             .unwrap();
 
         db.put("users", json!({"id": "u1", "city": "NYC", "age": 30}))
@@ -1716,7 +1716,7 @@ mod tests {
             .unwrap();
 
         // Create composite on existing data
-        db.create_index("users", "by_city_age", &["city", "age"], false)
+        db.create_index("users", "by_city_age", &["city", "age"], false, false)
             .unwrap();
 
         let docs = db
@@ -1731,7 +1731,7 @@ mod tests {
     fn test_query_builder_eq() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
         db.put("users", json!({"id": "u1", "email": "a@b.com"}))
             .unwrap();
@@ -1751,7 +1751,7 @@ mod tests {
     fn test_query_builder_composite_eq() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_city_age", &["city", "age"], false)
+        db.create_index("users", "by_city_age", &["city", "age"], false, false)
             .unwrap();
         db.put("users", json!({"id": "u1", "city": "NYC", "age": 30}))
             .unwrap();
@@ -1774,7 +1774,7 @@ mod tests {
     fn test_query_builder_range() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_age", &["age"], false).unwrap();
+        db.create_index("users", "by_age", &["age"], false, false).unwrap();
         db.put("users", json!({"id": "u1", "age": 30})).unwrap();
         db.put("users", json!({"id": "u2", "age": 25})).unwrap();
         db.put("users", json!({"id": "u3", "age": 35})).unwrap();
@@ -1791,7 +1791,7 @@ mod tests {
     fn test_query_builder_eq_and_range() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_city_age", &["city", "age"], false)
+        db.create_index("users", "by_city_age", &["city", "age"], false, false)
             .unwrap();
         db.put("users", json!({"id": "u1", "city": "NYC", "age": 30}))
             .unwrap();
@@ -1829,7 +1829,7 @@ mod tests {
     fn test_query_builder_order_by_asc() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_age", &["age"], false).unwrap();
+        db.create_index("users", "by_age", &["age"], false, false).unwrap();
         db.put("users", json!({"id": "u1", "age": 30})).unwrap();
         db.put("users", json!({"id": "u2", "age": 25})).unwrap();
         db.put("users", json!({"id": "u3", "age": 35})).unwrap();
@@ -1907,7 +1907,7 @@ mod tests {
     fn test_query_builder_bool_index() {
         let (db, _dir) = test_db();
         db.create_object_store("items", "id").unwrap();
-        db.create_index("items", "by_active", &["active"], false)
+        db.create_index("items", "by_active", &["active"], false, false)
             .unwrap();
         db.put("items", json!({"id": 1, "active": true})).unwrap();
         db.put("items", json!({"id": 2, "active": false})).unwrap();
@@ -1925,7 +1925,7 @@ mod tests {
     fn test_query_builder_with_transaction_roundtrip() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
         db.put("users", json!({"id": "u1", "email": "a@b.com"}))
             .unwrap();
@@ -1952,7 +1952,7 @@ mod tests {
     fn test_put_doc_and_get_doc() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
 
         let user = TestUser {
@@ -2020,7 +2020,7 @@ mod tests {
     fn test_collect_doc() {
         let (db, _dir) = test_db();
         db.create_object_store("users", "id").unwrap();
-        db.create_index("users", "by_email", &["email"], true)
+        db.create_index("users", "by_email", &["email"], true, false)
             .unwrap();
 
         db.put_doc(
@@ -2061,5 +2061,255 @@ mod tests {
 
         let retrieved: TestUser = db.get_doc("users", "u2").unwrap().unwrap();
         assert_eq!(retrieved.name, "Bob");
+    }
+
+    // ── IndexedDB compatibility tests ─────────────────────────────
+
+    #[test]
+    fn test_add_rejects_duplicate() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.add("users", json!({"id": "u1", "name": "Alice"}))
+            .unwrap();
+        let err = db
+            .add("users", json!({"id": "u1", "name": "Bob"}))
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // Original doc unchanged.
+        let doc = db.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(doc["name"], "Alice");
+    }
+
+    #[test]
+    fn test_clear_store() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1"})).unwrap();
+        db.put("users", json!({"id": "u2"})).unwrap();
+        db.put("users", json!({"id": "u3"})).unwrap();
+        assert_eq!(db.count("users").unwrap(), 3);
+
+        let removed = db.clear("users").unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(db.count("users").unwrap(), 0);
+        // Schema still exists.
+        let names = db.store_names();
+        assert!(names.contains(&"users".to_string()));
+    }
+
+    #[test]
+    fn test_get_all_with_count() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        for i in 0..10 {
+            db.put("users", json!({"id": format!("u{}", i)})).unwrap();
+        }
+        let all = db.get_all("users", None, None).unwrap();
+        assert_eq!(all.len(), 10);
+        let limited = db.get_all("users", None, Some(3)).unwrap();
+        assert_eq!(limited.len(), 3);
+    }
+
+    #[test]
+    fn test_get_all_keys() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1"})).unwrap();
+        db.put("users", json!({"id": "u2"})).unwrap();
+        let keys = db.get_all_keys("users", None, None).unwrap();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_get_key() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1"})).unwrap();
+        assert!(db.get_key("users", &json!("u1")).unwrap().is_some());
+        assert!(db.get_key("users", &json!("missing")).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_count_with_keyrange() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        for i in 0..10 {
+            db.put("users", json!({"id": format!("u{}", i)})).unwrap();
+        }
+        let kr = KeyRange::bound(json!("u3"), json!("u6"), false, false);
+        let n = db.count_with_query("users", Some(&kr)).unwrap();
+        assert_eq!(n, 4); // u3, u4, u5, u6
+    }
+
+    #[test]
+    fn test_multi_entry_index() {
+        let (db, _dir) = test_db();
+        db.create_object_store("items", "id").unwrap();
+        db.create_index("items", "by_tag", &["tags"], false, true)
+            .unwrap();
+        db.put("items", json!({"id": "i1", "tags": ["red", "blue"]})).unwrap();
+        db.put("items", json!({"id": "i2", "tags": ["blue", "green"]})).unwrap();
+        // Lookup by each tag should work.
+        let red = db.get_by_index("items", "by_tag", &json!("red")).unwrap();
+        assert_eq!(red.len(), 1);
+        let blue = db.get_by_index("items", "by_tag", &json!("blue")).unwrap();
+        assert_eq!(blue.len(), 2);
+    }
+
+    #[test]
+    fn test_key_range_only() {
+        let kr = KeyRange::only(json!("alice"));
+        assert!(kr.includes(&json!("alice")));
+        assert!(!kr.includes(&json!("bob")));
+    }
+
+    #[test]
+    fn test_key_range_bound_closed() {
+        let kr = KeyRange::bound(json!(10), json!(20), false, false);
+        assert!(kr.includes(&json!(10)));
+        assert!(kr.includes(&json!(15)));
+        assert!(kr.includes(&json!(20)));
+        assert!(!kr.includes(&json!(9)));
+        assert!(!kr.includes(&json!(21)));
+    }
+
+    #[test]
+    fn test_key_range_bound_open() {
+        let kr = KeyRange::bound(json!(10), json!(20), true, true);
+        assert!(!kr.includes(&json!(10)));
+        assert!(kr.includes(&json!(11)));
+        assert!(!kr.includes(&json!(20)));
+        assert!(kr.includes(&json!(19)));
+    }
+
+    #[test]
+    fn test_key_range_lower_bound() {
+        let kr = KeyRange::lower_bound(json!(18), false);
+        assert!(kr.includes(&json!(18)));
+        assert!(kr.includes(&json!(100)));
+        assert!(!kr.includes(&json!(17)));
+    }
+
+    #[test]
+    fn test_key_range_upper_bound() {
+        let kr = KeyRange::upper_bound(json!(65), true);
+        assert!(!kr.includes(&json!(65)));
+        assert!(kr.includes(&json!(64)));
+        assert!(!kr.includes(&json!(66)));
+    }
+
+    #[test]
+    fn test_cursor_next_forward() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "a"})).unwrap();
+        db.put("users", json!({"id": "b"})).unwrap();
+        db.put("users", json!({"id": "c"})).unwrap();
+
+        let mut cursor = db
+            .open_cursor("users", None, CursorDirection::Next)
+            .unwrap();
+        let (k1, _) = cursor.next_value().unwrap();
+        assert_eq!(k1, json!("a"));
+        let (k2, _) = cursor.next_value().unwrap();
+        assert_eq!(k2, json!("b"));
+        let (k3, _) = cursor.next_value().unwrap();
+        assert_eq!(k3, json!("c"));
+        assert!(cursor.next_value().is_none());
+    }
+
+    #[test]
+    fn test_cursor_prev_reverse() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "a"})).unwrap();
+        db.put("users", json!({"id": "b"})).unwrap();
+        db.put("users", json!({"id": "c"})).unwrap();
+
+        let mut cursor = db
+            .open_cursor("users", None, CursorDirection::Prev)
+            .unwrap();
+        let (k1, _) = cursor.next_value().unwrap();
+        assert_eq!(k1, json!("c"));
+        let (k2, _) = cursor.next_value().unwrap();
+        assert_eq!(k2, json!("b"));
+        let (k3, _) = cursor.next_value().unwrap();
+        assert_eq!(k3, json!("a"));
+    }
+
+    #[test]
+    fn test_cursor_advance() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        for i in 0..10 {
+            db.put("users", json!({"id": format!("u{}", i)})).unwrap();
+        }
+
+        let mut cursor = db
+            .open_cursor("users", None, CursorDirection::Next)
+            .unwrap();
+        let (k, _) = cursor.advance(5).unwrap();
+        assert_eq!(k, json!("u5"));
+        let (k, _) = cursor.next_value().unwrap();
+        assert_eq!(k, json!("u6"));
+    }
+
+    #[test]
+    fn test_cursor_with_keyrange() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        for i in 0..10 {
+            db.put("users", json!({"id": format!("u{}", i)})).unwrap();
+        }
+
+        let kr = KeyRange::bound(json!("u3"), json!("u5"), false, false);
+        let mut cursor = db
+            .open_cursor("users", Some(&kr), CursorDirection::Next)
+            .unwrap();
+        let mut keys = Vec::new();
+        while let Some((k, _)) = cursor.next_value() {
+            keys.push(k);
+        }
+        assert_eq!(keys, vec![json!("u3"), json!("u4"), json!("u5")]);
+    }
+
+    #[test]
+    fn test_index_cursor() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.create_index("users", "by_age", &["age"], false, false)
+            .unwrap();
+        db.put("users", json!({"id": "u1", "age": 25})).unwrap();
+        db.put("users", json!({"id": "u2", "age": 30})).unwrap();
+        db.put("users", json!({"id": "u3", "age": 35})).unwrap();
+
+        let mut cursor = db
+            .open_cursor_on_index("users", "by_age", None, CursorDirection::Next)
+            .unwrap();
+        let (idx_val, pk, doc) = cursor.next_value().unwrap();
+        assert_eq!(idx_val, json!(25));
+        assert_eq!(pk, json!("u1"));
+        assert_eq!(doc["age"], 25);
+    }
+
+    #[test]
+    fn test_transaction_add_clear() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1", "name": "Alice"})).unwrap();
+
+        let mut tx = db
+            .transaction(&["users"], TransactionMode::ReadWrite)
+            .unwrap();
+        // add should fail for existing key.
+        let err = tx.add("users", json!({"id": "u1"})).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // add should succeed for new key.
+        tx.add("users", json!({"id": "u2", "name": "Bob"})).unwrap();
+        // clear should remove all.
+        tx.clear("users").unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(db.count("users").unwrap(), 0);
     }
 }

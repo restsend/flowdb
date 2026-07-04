@@ -3,8 +3,10 @@
 //! Provides an IndexedDB-like API with ACID transactions, secondary indexes,
 //! and auto-increment support.
 
+pub(crate) mod cursor;
 pub(crate) mod db;
 pub(crate) mod helpers;
+pub(crate) mod keyrange;
 pub(crate) mod query;
 #[cfg(test)]
 mod tests;
@@ -15,7 +17,9 @@ mod schema;
 
 use serde_json::Value;
 
+pub use cursor::{Cursor, CursorDirection, IndexCursor};
 pub use db::JsonDB;
+pub use keyrange::KeyRange;
 pub use query::{QueryBuilder, SortDir};
 pub use schema::{IndexDef as IndexSchema, StoreDef as StoreSchema};
 pub use transaction::Transaction;

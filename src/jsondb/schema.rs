@@ -109,7 +109,7 @@ impl StoreDef {
     ///
     /// Equivalent to the old style:
     /// ```ignore
-    /// db.create_index("users", "by_email", &["email"], true)?;
+    /// db.create_index("users", "by_email", &["email"], true, false)?;
     /// ```
     pub fn with_index(mut self, name: &str, key_paths: &[&str], unique: bool) -> Self {
         self.indexes.push(IndexDef {

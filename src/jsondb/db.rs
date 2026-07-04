@@ -1,7 +1,9 @@
 use crate::engine::Engine;
 use crate::error::{FlowError, Result};
+use crate::jsondb::cursor::{Cursor, CursorDirection, IndexCursor};
 use crate::jsondb::encoding::*;
 use crate::jsondb::helpers::*;
+use crate::jsondb::keyrange::KeyRange;
 use crate::jsondb::query::QueryBuilder;
 use crate::jsondb::schema::*;
 use crate::jsondb::{KeyArg, ObjectStore, Transaction, TransactionMode};
@@ -33,7 +35,7 @@ use std::ops::Bound;
 ///
 /// let db = JsonDB::open(Default::default()).unwrap();
 /// db.create_object_store("users", "id").unwrap();
-/// db.create_index("users", "by_email", &["email"], true).unwrap();
+/// db.create_index("users", "by_email", &["email"], true, false).unwrap();
 /// db.put("users", json!({"id": "u1", "email": "a@b.com"})).unwrap();
 /// let doc = db.get("users", &json!("u1")).unwrap();
 /// ```
@@ -46,7 +48,7 @@ use std::ops::Bound;
 ///
 /// let db = JsonDB::open(Default::default()).unwrap();
 /// db.create_object_store("users", "id").unwrap();
-/// db.create_index("users", "by_email", &["email"], true).unwrap();
+/// db.create_index("users", "by_email", &["email"], true, false).unwrap();
 ///
 /// db.put("users", json!({"id": "u1", "email": "a@b.com"})).unwrap();
 /// let doc = db.get("users", &json!("u1")).unwrap();
@@ -200,6 +202,7 @@ impl JsonDB {
         name: &str,
         key_paths: &[&str],
         unique: bool,
+        multi_entry: bool,
     ) -> Result<()> {
         let mut def = self
             .schema
@@ -211,7 +214,7 @@ impl JsonDB {
             name: name.to_string(),
             key_paths: key_paths.iter().map(|s| s.to_string()).collect(),
             unique,
-            multi_entry: false,
+            multi_entry,
         };
 
         def.indexes.push(index.clone());
@@ -256,7 +259,7 @@ impl JsonDB {
         key_path: &str,
         unique: bool,
     ) -> Result<()> {
-        self.create_index(store, name, &[key_path], unique)
+        self.create_index(store, name, &[key_path], unique, false)
     }
 
     /// Delete a secondary index (removes all index entries).
@@ -340,7 +343,7 @@ impl JsonDB {
                 }
                 for idx in &def.indexes {
                     let paths: Vec<&str> = idx.key_paths.iter().map(|s| s.as_str()).collect();
-                    self.create_index(&def.name, &idx.name, &paths, idx.unique)?;
+                    self.create_index(&def.name, &idx.name, &paths, idx.unique, idx.multi_entry)?;
                 }
                 Ok(())
             }
@@ -372,7 +375,7 @@ impl JsonDB {
                 for idx in &def.indexes {
                     if !existing.indexes.iter().any(|i| i.name == idx.name) {
                         let paths: Vec<&str> = idx.key_paths.iter().map(|s| s.as_str()).collect();
-                        self.create_index(&def.name, &idx.name, &paths, idx.unique)?;
+                        self.create_index(&def.name, &idx.name, &paths, idx.unique, idx.multi_entry)?;
                     }
                 }
 
@@ -578,6 +581,170 @@ impl JsonDB {
         Ok(docs)
     }
 
+    /// Insert a document only if the key does not already exist.
+    ///
+    /// Returns an error if a document with the same primary key already exists
+    /// (IndexedDB `add()` semantics).
+    pub fn add(&self, store: &str, doc: Value) -> Result<Value> {
+        let _lock = self.write_lock.lock().unwrap();
+        let def = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+        let key_val = extract_field(&doc, &def.key_path).ok_or_else(|| {
+            FlowError::JsonDb(format!(
+                "document missing key_path '{}' for store '{}'",
+                def.key_path, store
+            ))
+        })?;
+        let key_bytes = encode_primary_key(&key_val)?;
+
+        if self.engine.get_bytes(&doc_key(store, &key_bytes), 0).is_some() {
+            return Err(FlowError::JsonDb(format!(
+                "a record with key '{:?}' already exists in store '{}'",
+                key_val, store
+            )));
+        }
+
+        let doc_bytes = encode_doc(&doc)?;
+        let batch = build_put_batch(&def, store, &key_bytes, &doc_bytes, &doc, &self.engine)?;
+        self.engine.write_internal(batch)?;
+        Ok(key_val)
+    }
+
+    /// Remove all documents (and their index entries) from a store, preserving
+    /// the store schema. Returns the number of documents removed.
+    pub fn clear(&self, store: &str) -> Result<usize> {
+        let _lock = self.write_lock.lock().unwrap();
+        let def = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+
+        let count = self.count(store)?;
+
+        let mut records = Vec::new();
+
+        // Range-delete all index entries for each index.
+        for index in &def.indexes {
+            let pfx = idx_prefix(store, &index.name);
+            let end = crate::record::increment_prefix_bytes(&pfx);
+            records.push(InternalRecord::delete_range(pfx, end, 0));
+        }
+
+        // Range-delete all documents.
+        let doc_pfx = doc_prefix(store);
+        let doc_end = crate::record::increment_prefix_bytes(&doc_pfx);
+        records.push(InternalRecord::delete_range(doc_pfx, doc_end, 0));
+
+        self.engine.write_internal(records)?;
+        Ok(count)
+    }
+
+    /// Retrieve documents in primary-key order, optionally filtered by a
+    /// [`KeyRange`] and limited to `count` results (IndexedDB `getAll`).
+    pub fn get_all(
+        &self,
+        store: &str,
+        query: Option<&KeyRange>,
+        count: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let _ = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+
+        let range = match query {
+            Some(kr) => kr.to_doc_scan_range(store)?,
+            None => prefix_range(&doc_prefix(store)),
+        };
+
+        let iter = self.engine.scan(range)?;
+        let mut docs = Vec::new();
+        for r in iter {
+            let rec = r?;
+            docs.push(decode_doc(&rec.value)?);
+            if let Some(n) = count {
+                if docs.len() >= n {
+                    break;
+                }
+            }
+        }
+        Ok(docs)
+    }
+
+    /// Retrieve only the primary keys of documents, optionally filtered by a
+    /// [`KeyRange`] and limited to `count` results (IndexedDB `getAllKeys`).
+    pub fn get_all_keys(
+        &self,
+        store: &str,
+        query: Option<&KeyRange>,
+        count: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let def = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+
+        let range = match query {
+            Some(kr) => kr.to_doc_scan_range(store)?,
+            None => prefix_range(&doc_prefix(store)),
+        };
+
+        let iter = self.engine.scan(range)?;
+        let mut keys = Vec::new();
+        for r in iter {
+            let rec = r?;
+            let doc = decode_doc(&rec.value)?;
+            if let Some(key_val) = extract_field(&doc, &def.key_path) {
+                keys.push(key_val);
+            }
+            if let Some(n) = count {
+                if keys.len() >= n {
+                    break;
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Check whether a key exists and return the key value (IndexedDB `getKey`).
+    /// Returns `None` if no document with the given key exists.
+    pub fn get_key(&self, store: &str, key: &Value) -> Result<Option<Value>> {
+        let _ = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+        let key_bytes = encode_primary_key(key)?;
+        if self.engine.get_bytes(&doc_key(store, &key_bytes), 0).is_some() {
+            Ok(Some(key.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Count documents, optionally filtered by a [`KeyRange`]
+    /// (IndexedDB `store.count(query)`).
+    pub fn count_with_query(&self, store: &str, query: Option<&KeyRange>) -> Result<usize> {
+        let _ = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+
+        let range = match query {
+            Some(kr) => kr.to_doc_scan_range(store)?,
+            None => prefix_range(&doc_prefix(store)),
+        };
+
+        let iter = self.engine.scan(range)?;
+        let mut count = 0;
+        for r in iter {
+            let _ = r?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Look up documents by an exact index value.
     pub fn get_by_index(&self, store: &str, index: &str, value: &Value) -> Result<Vec<Value>> {
         let _def = self
@@ -745,5 +912,29 @@ impl JsonDB {
     /// Delete a document by primary key, accepting any `KeyArg` type.
     pub fn delete_doc(&self, store: &str, key: impl KeyArg) -> Result<()> {
         self.delete(store, &key.into_value())
+    }
+
+    // ── cursors ─────────────────────────────────────────────────────
+
+    /// Open a [`Cursor`] over a store's primary-key space, optionally filtered
+    /// by a [`KeyRange`], with the given [`CursorDirection`].
+    pub fn open_cursor(
+        &self,
+        store: &str,
+        range: Option<&KeyRange>,
+        direction: CursorDirection,
+    ) -> Result<Cursor> {
+        Cursor::open(self, store, range, direction)
+    }
+
+    /// Open an [`IndexCursor`] over an index's value space.
+    pub fn open_cursor_on_index(
+        &self,
+        store: &str,
+        index: &str,
+        range: Option<&KeyRange>,
+        direction: CursorDirection,
+    ) -> Result<IndexCursor> {
+        IndexCursor::open(self, store, index, range, direction)
     }
 }

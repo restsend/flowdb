@@ -30,7 +30,7 @@ pub enum SortDir {
 ///
 /// let db = JsonDB::open(Default::default()).unwrap();
 /// db.create_object_store("users", "id").unwrap();
-/// db.create_index("users", "by_city_age", &["city", "age"], false).unwrap();
+/// db.create_index("users", "by_city_age", &["city", "age"], false, false).unwrap();
 /// db.put("users", json!({"id": "u1", "city": "NYC", "age": 30})).unwrap();
 ///
 /// let docs: Vec<serde_json::Value> = db.query("users")

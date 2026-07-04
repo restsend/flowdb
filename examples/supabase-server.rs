@@ -384,8 +384,8 @@ async fn main() {
     db.apply_schema::<TodoStore>().unwrap();
 
     // Compound indexes (multi-field, not expressible via single #[index])
-    db.create_index("todos", "by_user_status", &["user_id", "status"], false).unwrap();
-    db.create_index("todos", "by_user_priority", &["user_id", "priority"], false).unwrap();
+    db.create_index("todos", "by_user_status", &["user_id", "status"], false, false).unwrap();
+    db.create_index("todos", "by_user_priority", &["user_id", "priority"], false, false).unwrap();
 
     let state = Arc::new(AppState { db });
 

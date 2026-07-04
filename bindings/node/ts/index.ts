@@ -1,3 +1,4 @@
 export { FlowDB } from './jsondb'
 export { Transaction } from './transaction'
-export type { OpenConfig } from './types'
+export { KeyRange } from './types'
+export type { OpenConfig, KeyRange as KeyRangeT, CursorDirection, CursorItem, IndexCursorItem } from './types'
