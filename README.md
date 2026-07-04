@@ -69,17 +69,36 @@ npm install @restsend/flowdb
 ```
 
 ```js
-const { FlowDB } = require('@restsend/flowdb')
+const { FlowDB, KeyRange } = require('@restsend/flowdb')
 
 const db = FlowDB.open({ dataDir: './data' })
 await db.createObjectStore('users', 'id')
-await db.createIndex('users', 'byEmail', ['email'], true)
+await db.createIndex('users', 'byEmail', 'email', { unique: true })
 
+// CRUD
 await db.put('users', { id: 'u1', email: 'a@b.com' })
 const doc = await db.get('users', 'u1')
+await db.add('users', { id: 'u2', email: 'b@b.com' }) // insert-only
 
+// Query with KeyRange + getAll
+const kr = KeyRange.bound('u1', 'u5')
+const results = await db.getAll('users', kr, 10)
+
+// Cursor (callback style)
+await db.openCursor('users', null, 'next', (item) => {
+  if (item.done) return
+  console.log(item.key, item.value)
+})
+
+// Cursor (async iterator)
+for await (const item of db.cursor('users', null, 'next')) {
+  console.log(item.key, item.value)
+}
+
+// Transaction with read-your-writes
 const tx = db.transaction(['users'], 'readwrite')
-tx.put('users', { id: 'u2', email: 'b@b.com' })
+tx.put('users', { id: 'u3', email: 'c@c.com' })
+const read = await tx.get('users', 'u3') // sees pending write!
 await tx.commit()
 await db.close()
 ```
@@ -182,9 +201,15 @@ cargo run --example supabase-server   # then open http://localhost:3000
 - Read-your-writes consistency within transactions
 - Snapshot isolation via MVCC sequence numbers
 - Schema persistence across restarts (automatic recovery)
-- IndexedDB-like API — `create_object_store`, `create_index`, `put`, `get`, `delete`, `transaction`
+- **Full IndexedDB-compatible API** — `add`, `clear`, `getAll`, `getAllKeys`, `getKey`, `count(query?)`, `openCursor`
+- **KeyRange** factory — `KeyRange.only()`, `.bound()`, `.lowerBound()`, `.upperBound()`
+- **Cursor** with 4 directions — `next`, `prev`, `nextunique`, `prevunique`
+- **Async iterator** — `for await (const item of db.cursor(store, range, dir))`
+- IndexedDB-like schema API — `create_object_store`, `create_index`, `put`, `get`, `delete`, `transaction`
 - Index queries — point lookup (`get_by_index`) and range queries (`range_by_index`)
 - Multi-field indexes via dotted key paths (e.g. `"address.city"`)
+- Multi-entry indexes (`multiEntry: true`) for array-valued fields
+- Auto-increment primary keys (`put_auto`)
 - Primary key null-byte (`\x00`) validation — prevents composite-key separator injection
 
 ---

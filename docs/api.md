@@ -123,7 +123,7 @@ impl Record {
 
 ## Config
 
-```rust
+ ```rust
 pub struct Config {
     pub data_dir: PathBuf,
     pub default_ttl_secs: Option<u64>,     // default TTL for all records (max ~9.22e12)
@@ -142,6 +142,7 @@ pub struct Config {
     pub create_if_missing: bool,            // default: true
     pub wal_sync_mode: SyncMode,            // default: Always
     pub auto_background: bool,              // default: true
+    pub storage_backend: StorageBackendKind,// default: MultiFile
 }
 ```
 
@@ -219,27 +220,43 @@ pub fn JsonDB::close(&self) -> Result<()>
 pub fn JsonDB::engine(&self) -> &Engine
 ```
 
-### Schema Management
+ ### Schema Management
 
 ```rust
 pub fn JsonDB::create_object_store(&self, name: &str, key_path: &str) -> Result<()>
 pub fn JsonDB::delete_object_store(&self, name: &str) -> Result<()>
-pub fn JsonDB::create_index(&self, store: &str, name: &str, key_paths: &[&str], unique: bool) -> Result<()>
+pub fn JsonDB::create_index(
+    &self, store: &str, name: &str, key_paths: &[&str],
+    unique: bool, multi_entry: bool             // multiEntry support
+) -> Result<()>
 pub fn JsonDB::create_index_on(&self, store: &str, name: &str, key_path: &str, unique: bool) -> Result<()>
 pub fn JsonDB::delete_index(&self, store: &str, name: &str) -> Result<()>
 pub fn JsonDB::store_names(&self) -> Vec<String>
 pub fn JsonDB::get_store(&self, name: &str) -> Option<StoreDef>
 ```
 
-### CRUD
+ ### CRUD
 
 ```rust
-pub fn JsonDB::put(&self, store: &str, doc: Value) -> Result<Value>
+pub fn JsonDB::put(&self, store: &str, doc: Value) -> Result<Value>       // upsert
+pub fn JsonDB::add(&self, store: &str, doc: Value) -> Result<Value>       // insert-only, error on dup
 pub fn JsonDB::get(&self, store: &str, key: &Value) -> Result<Option<Value>>
+pub fn JsonDB::get_with_meta(&self, store: &str, key: &Value) -> Result<Option<(Value, i64, i64)>>
+pub fn JsonDB::get_key(&self, store: &str, key: &Value) -> Result<Option<Value>>
 pub fn JsonDB::delete(&self, store: &str, key: &Value) -> Result<()>
-pub fn JsonDB::put_auto(&self, store: &str, doc: Value) -> Result<Value>
+pub fn JsonDB::put_auto(&self, store: &str, doc: Value) -> Result<Value>  // auto-increment
+pub fn JsonDB::clear(&self, store: &str) -> Result<usize>                  // remove all, preserve schema
+```
+
+### Bulk / Scan
+
+```rust
 pub fn JsonDB::count(&self, store: &str) -> Result<usize>
+pub fn JsonDB::count_with_query(&self, store: &str, query: Option<&KeyRange>) -> Result<usize>
 pub fn JsonDB::scan(&self, store: &str) -> Result<Vec<Value>>
+pub fn JsonDB::scan_with_meta(&self, store: &str) -> Result<Vec<(Value, i64, i64)>>
+pub fn JsonDB::get_all(&self, store: &str, query: Option<&KeyRange>, count: Option<usize>) -> Result<Vec<Value>>
+pub fn JsonDB::get_all_keys(&self, store: &str, query: Option<&KeyRange>, count: Option<usize>) -> Result<Vec<Value>>
 ```
 
 > **Security:** String primary keys must not contain null bytes (`\x00`).
@@ -279,8 +296,10 @@ pub fn JsonDB::transaction<'db>(&'db self, stores: &[&str], mode: TransactionMod
 pub enum TransactionMode { ReadOnly, ReadWrite }
 
 impl Transaction {
-    pub fn put(&mut self, store: &str, doc: Value) -> Result<Value>
-    pub fn get(&self, store: &str, key: &Value) -> Result<Option<Value>>
+    pub fn put(&mut self, store: &str, doc: Value) -> Result<Value>     // upsert
+    pub fn add(&mut self, store: &str, doc: Value) -> Result<Value>      // insert-only (read-your-writes)
+    pub fn clear(&mut self, store: &str) -> Result<()>                   // remove all docs within tx
+    pub fn get(&self, store: &str, key: &Value) -> Result<Option<Value>> // read-your-writes
     pub fn delete(&mut self, store: &str, key: &Value) -> Result<()>
     pub fn count(&self, store: &str) -> Result<usize>
     pub fn scan(&self, store: &str) -> Result<Vec<Value>>
@@ -290,6 +309,60 @@ impl Transaction {
     pub fn commit(self) -> Result<()>
     pub fn abort(self)
 }
+```
+
+### KeyRange
+
+```rust
+pub struct KeyRange {
+    pub lower: Option<Value>,
+    pub upper: Option<Value>,
+    pub lower_open: bool,
+    pub upper_open: bool,
+}
+
+impl KeyRange {
+    pub fn only(key: Value) -> Self
+    pub fn bound(lower: Value, upper: Value, lower_open: bool, upper_open: bool) -> Self
+    pub fn lower_bound(key: Value, open: bool) -> Self
+    pub fn upper_bound(key: Value, open: bool) -> Self
+    pub fn includes(&self, key: &Value) -> bool
+}
+```
+
+Used with `get_all`, `get_all_keys`, `count_with_query`, `open_cursor`.
+
+### Cursor
+
+```rust
+pub enum CursorDirection { Next, NextUnique, Prev, PrevUnique }
+
+impl CursorDirection {
+    pub fn is_reverse(&self) -> bool
+    pub fn is_unique(&self) -> bool
+    pub fn parse(s: &str) -> Result<Self>
+}
+
+pub struct Cursor { /* pre-materialized (key, value) pairs */ }
+
+impl Cursor {
+    pub fn next_value(&mut self) -> Option<(Value, Value)>     // (key, doc)
+    pub fn advance(&mut self, count: usize) -> Option<(Value, Value)>
+    pub fn remaining(&self) -> usize
+    pub fn current_key(&self) -> Option<&Value>
+}
+
+pub struct IndexCursor { /* pre-materialized (idx_key, pk, doc) triples */ }
+
+impl IndexCursor {
+    pub fn next_value(&mut self) -> Option<(Value, Value, Value)>
+    pub fn advance(&mut self, count: usize) -> Option<(Value, Value, Value)>
+    pub fn remaining(&self) -> usize
+}
+
+// Open cursors from JsonDB:
+pub fn JsonDB::open_cursor(&self, store: &str, range: Option<&KeyRange>, direction: CursorDirection) -> Result<Cursor>
+pub fn JsonDB::open_cursor_on_index(&self, store: &str, index: &str, range: Option<&KeyRange>, direction: CursorDirection) -> Result<IndexCursor>
 ```
 
 ### Serde (Typed) API
