@@ -75,7 +75,14 @@ impl SupaBase {
     // ── Auth ───────────────────────────────────────────────────
 
     /// Sign up: insert user + create session atomically.
-    fn sign_up(&self, email: &str, password: &str) -> Value {
+    /// Returns Ok(response_json) on success, or Err if email already exists.
+    fn sign_up(&self, email: &str, password: &str) -> Result<Value, String> {
+        // Check for duplicate email proactively (unique index prevents it,
+        // but we want a friendly error message).
+        if self.get_user_by_email(email).is_some() {
+            return Err(format!("email '{}' already exists", email));
+        }
+
         let user_id = uuid_v4();
         let token = uuid_v4();
 
@@ -84,7 +91,8 @@ impl SupaBase {
             .transaction(&["users", "sessions"], TransactionMode::ReadWrite)
             .unwrap();
 
-        tx.add(
+        // Use put() for the atomic sign-up (duplicate checked above).
+        tx.put(
             "users",
             serde_json::json!({
                 "id": user_id,
@@ -106,7 +114,7 @@ impl SupaBase {
         .unwrap();
 
         tx.commit().unwrap();
-        serde_json::json!({"user_id": user_id, "token": token})
+        Ok(serde_json::json!({"user_id": user_id, "token": token}))
     }
 
     /// Look up user by email (unique-index query).
@@ -201,8 +209,8 @@ fn main() {
     let app = SupaBase::open(dir.path());
 
     // ── Sign up two users ──────────────────────────────────────
-    let alice = app.sign_up("alice@ex.com", "p4ss1");
-    let bob = app.sign_up("bob@ex.com", "p4ss2");
+    let alice = app.sign_up("alice@ex.com", "p4ss1").unwrap();
+    let bob = app.sign_up("bob@ex.com", "p4ss2").unwrap();
     println!(
         "Users: alice={} bob={}",
         alice["user_id"].as_str().unwrap(),
@@ -239,7 +247,7 @@ fn main() {
 
     // ── Duplicate sign-up prevented by add() ────────────────────
     let dup = app.sign_up("alice@ex.com", "dup");
-    println!("Duplicate sign-up prevented: {:?}", dup);
+    println!("Duplicate sign-up prevented: {}", dup.unwrap_err());
 
     // ── Paginated todo query ───────────────────────────────────
     for i in 0..10 {

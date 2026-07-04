@@ -15,6 +15,7 @@ async function main() {
   // Create stores
   await db.createObjectStore('users', 'id')
   await db.createObjectStore('events', '_id', true) // auto-increment
+  await db.createObjectStore('items', 'id')
 
   // Create indexes (with options object for unique + multiEntry)
   await db.createIndex('users', 'byEmail', 'email', { unique: true })
@@ -37,13 +38,13 @@ async function main() {
   console.log('getKey:', JSON.stringify(keyExists))
 
   // ── Bulk reads with KeyRange ────────────────────────────────
-  const kr = KeyRange.bound('Alice', 'Charlie')
-  const results = await db.getAll('users', kr)
-  console.log('getAll by name range:', results.length)
-  const keys = await db.getAllKeys('users', kr)
-  console.log('getAllKeys:', JSON.stringify(keys))
-  const total = await db.count('users', kr)
-  console.log('count(range):', total)
+  const kr = KeyRange.bound('u1', 'u3')
+  const results_ = await db.getAll('users', kr)
+  console.log('getAll by id range:', results_.length)
+  const keys_ = await db.getAllKeys('users', kr)
+  console.log('getAllKeys:', JSON.stringify(keys_))
+  const total_ = await db.count('users', kr)
+  console.log('count(range):', total_)
 
   // ── Index queries ───────────────────────────────────────────
   const byEmail = await db.getByIndex('users', 'byEmail', 'a@b.com')
@@ -71,13 +72,15 @@ async function main() {
   }
   console.log('cursor reverse:', JSON.stringify(names))
 
-  // ── Transaction with read-your-writes ───────────────────────
-  const tx = db.transaction(['users'], 'readwrite')
+  // ── Transaction with atomic commit ──────────────────────────
+  const tx = db.transaction(['users', 'events'], 'readwrite')
   tx.put('users', { id: 'u4', name: 'Diana', email: 'd@b.com', age: 28 })
-  const txRead = await tx.get('users', 'u4') // sees pending write
-  console.log('tx read-your-writes:', txRead.name)
   tx.putAuto('events', { type: 'tx-auto' })
   await tx.commit()
+  // After commit, the data is visible to all readers.
+  const txRead = await db.get('users', 'u4')
+  console.log('tx committed, u4:', txRead.name)
+  console.log('tx putAuto events:', await db.count('events'))
 
   // ── Clear ───────────────────────────────────────────────────
   await db.clear('events')

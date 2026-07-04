@@ -178,15 +178,15 @@ fn main() {
 
     // ── 14. getAll + KeyRange + count with query ───────────────
     for i in 0..20u64 {
-        db.put("users", json!({"id": format!("p{}", i), "email": format!("p{}@x.com", i), "age": 20 + i})).unwrap();
+        db.put("users", json!({"id": format!("p{:02}", i), "email": format!("p{}@x.com", i), "age": 20 + i, "city": if i < 10 { "NYC" } else { "SF" }})).unwrap();
     }
-    let kr = KeyRange::bound(json!("p5"), json!("p10"), false, false);
+    let kr = KeyRange::bound(json!("p05"), json!("p10"), false, false);
     let batch = db.get_all("users", Some(&kr), Some(3)).unwrap();
     assert_eq!(batch.len(), 3);
     let keys = db.get_all_keys("users", Some(&kr), Some(3)).unwrap();
     println!("getAll limit=3: first {}, keys: {:?}", batch[0]["id"], keys);
     let total = db.count_with_query("users", Some(&kr)).unwrap();
-    println!("count_with_query [p5..p10]: {}", total);
+    println!("count_with_query [p05..p10]: {}", total);
 
     // ── 15. Pagination with QueryBuilder limit/offset ───────────
     let page1 = db.query("users")
