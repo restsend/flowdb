@@ -81,6 +81,7 @@ class FlowDB {
     if (config.memtableSizeMb != null) cfg.memtableSizeMb = config.memtableSizeMb
     if (config.blockCacheCapacityMb != null) cfg.blockCacheCapacityMb = config.blockCacheCapacityMb
     if (config.bloomBitsPerKey != null) cfg.bloomBitsPerKey = config.bloomBitsPerKey
+    if (config.compactionIntervalMs != null) cfg.compactionIntervalMs = config.compactionIntervalMs
     const db = native.FlowDb.open(cfg)
     return new FlowDB(db)
   }

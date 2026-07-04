@@ -65,6 +65,7 @@ function main() {
     const platformPkg = {
       name: `@restsend/flowdb-${suffix}`,
       version: VERSION,
+      description: `FlowDB native binary for ${suffix}`,
       ...plat,
       main: file,
     }
