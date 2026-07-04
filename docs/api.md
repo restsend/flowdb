@@ -138,6 +138,7 @@ pub struct Config {
     pub bloom_bits_per_key: usize,          // default: 10
     pub wal_segment_size_mb: u64,           // default: 64
     pub compaction_threshold: usize,        // default: 2
+    pub compaction_interval_ms: u64,        // default: 60000 (60s)
     pub create_if_missing: bool,            // default: true
     pub wal_sync_mode: SyncMode,            // default: Always
     pub auto_background: bool,              // default: true

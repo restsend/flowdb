@@ -107,6 +107,7 @@ fn flowdb_config(dir: &Path) -> Config {
         bloom_bits_per_key: 10,
         wal_segment_size_mb: 64,
         compaction_threshold: 1,
+        compaction_interval_ms: 60_000,
         create_if_missing: true,
         wal_sync_mode: flowdb::SyncMode::IntervalMs(u64::MAX),
         auto_background: false,

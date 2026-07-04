@@ -5,4 +5,5 @@ export interface OpenConfig {
   memtableSizeMb?: number
   blockCacheCapacityMb?: number
   bloomBitsPerKey?: number
+  compactionIntervalMs?: number
 }

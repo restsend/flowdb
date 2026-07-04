@@ -1,6 +1,6 @@
 {
   "name": "@restsend/flowdb",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "description": "IndexedDB-compatible embedded JSON document store for Node.js — powered by FlowDB (Rust)",
   "main": "index.js",
   "types": "dist/index.d.ts",

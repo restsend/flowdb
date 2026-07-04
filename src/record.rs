@@ -258,6 +258,12 @@ pub struct Config {
     /// Number of SST files needed to trigger a compaction (default: 2).
     /// Higher values reduce write amplification but increase read amplification.
     pub compaction_threshold: usize,
+    /// Background compaction interval in milliseconds (default: 60000 = 60 seconds).
+    /// The background maintenance thread checks for compaction candidates at this
+    /// interval, independently of `gc_interval_secs`. Lower values keep SST file
+    /// counts low at the cost of more CPU/IO for merging.
+    #[serde(default = "default_compaction_interval_ms")]
+    pub compaction_interval_ms: u64,
     /// Auto-create the data directory if it does not exist (default: true).
     pub create_if_missing: bool,
     /// WAL sync mode (default: `SyncMode::Always`).
@@ -281,6 +287,10 @@ fn default_background() -> bool {
     true
 }
 
+fn default_compaction_interval_ms() -> u64 {
+    60_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -297,6 +307,7 @@ impl Default for Config {
             bloom_bits_per_key: 10,
             wal_segment_size_mb: 64,
             compaction_threshold: 2,
+            compaction_interval_ms: 60_000,
             create_if_missing: true,
             wal_sync_mode: SyncMode::Always,
             auto_background: true,
@@ -344,6 +355,11 @@ impl Config {
         if self.compaction_threshold == 0 {
             return Err(FlowError::Config(
                 "compaction_threshold must be >= 1 (0 disables compaction entirely)".into(),
+            ));
+        }
+        if self.compaction_interval_ms == 0 {
+            return Err(FlowError::Config(
+                "compaction_interval_ms must be >= 1 (0 causes tight-loop spinning)".into(),
             ));
         }
         if self.block_cache_capacity_mb == 0 {
@@ -667,6 +683,7 @@ mod tests {
         assert_eq!(config.bloom_bits_per_key, 10);
         assert_eq!(config.wal_segment_size_mb, 64);
         assert_eq!(config.compaction_threshold, 2);
+        assert_eq!(config.compaction_interval_ms, 60_000);
         assert!(config.create_if_missing);
     }
 
@@ -781,6 +798,7 @@ mod tests {
         let c: Config = serde_json::from_str(json).unwrap();
         assert_eq!(c.wal_sync_mode, SyncMode::Always);
         assert!(c.auto_background);
+        assert_eq!(c.compaction_interval_ms, 60_000);
     }
 
     #[test]
@@ -871,6 +889,15 @@ mod tests {
     fn test_config_validate_compaction_threshold_zero() {
         let cfg = Config {
             compaction_threshold: 0,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validate_compaction_interval_zero() {
+        let cfg = Config {
+            compaction_interval_ms: 0,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());

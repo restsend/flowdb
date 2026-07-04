@@ -125,6 +125,7 @@ impl Engine {
         let compaction_threshold = self.config.compaction_threshold;
         let flush_interval = self.config.flush_interval_ms.max(1);
         let gc_interval = self.config.gc_interval_secs.max(1);
+        let compaction_interval = self.config.compaction_interval_ms.max(1);
         let wal_sync_mode = self.config.wal_sync_mode;
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -134,7 +135,7 @@ impl Engine {
             .name("flowdb-maintenance".into())
             .spawn(move || {
                 let flush_dur = std::time::Duration::from_millis(flush_interval);
-                let compact_dur = std::time::Duration::from_secs(gc_interval.max(1));
+                let compact_dur = std::time::Duration::from_millis(compaction_interval);
                 let gc_dur = std::time::Duration::from_secs(gc_interval);
 
                 // WAL sync tick for SyncMode::IntervalMs
@@ -145,6 +146,7 @@ impl Engine {
 
                 // Poll at the shortest interval, but no more than 4×/sec.
                 let poll = flush_dur
+                    .min(compact_dur)
                     .min(wal_sync_dur)
                     .min(std::time::Duration::from_millis(250));
 
@@ -1540,6 +1542,7 @@ mod tests {
             bloom_bits_per_key: 10,
             wal_segment_size_mb: 64,
             compaction_threshold: 2,
+            compaction_interval_ms: 60_000,
             create_if_missing: true,
             wal_sync_mode: SyncMode::IntervalMs(u64::MAX),
             auto_background: false,
@@ -2653,6 +2656,7 @@ mod tests {
         // Short flush interval so the WAL/flush tick fires quickly.
         cfg.flush_interval_ms = 10;
         cfg.gc_interval_secs = 1;
+        cfg.compaction_interval_ms = 1_000;
         cfg.wal_sync_mode = SyncMode::IntervalMs(10);
         let engine = Engine::open(cfg).unwrap();
         // Write a record so the flush tick has something to do.
@@ -2670,6 +2674,7 @@ mod tests {
         let mut cfg = make_config(dir.path());
         cfg.flush_interval_ms = 10;
         cfg.gc_interval_secs = 1;
+        cfg.compaction_interval_ms = 1_000;
         cfg.wal_sync_mode = SyncMode::IntervalMs(10);
         let engine = Engine::open(cfg).unwrap();
         let handle = engine
@@ -2677,6 +2682,90 @@ mod tests {
             .expect("handle should be Some");
         std::thread::sleep(std::time::Duration::from_millis(40));
         drop(handle);
+        engine.shutdown().unwrap();
+    }
+
+    /// Compaction must fire on `compaction_interval_ms`, independently of
+    /// `gc_interval_secs`. This test sets GC to an extremely long interval
+    /// and verifies that compaction still runs frequently, keeping SST count
+    /// low. If compaction were still coupled to gc_interval_secs, the SST
+    /// count would stay at 5+ and this test would fail.
+    #[test]
+    fn test_background_compaction_independent_interval() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = make_config(dir.path());
+        cfg.auto_background = true;
+        cfg.flush_interval_ms = 10;
+        cfg.compaction_interval_ms = 100;
+        cfg.gc_interval_secs = 999_999;
+        cfg.compaction_threshold = 2;
+        cfg.wal_sync_mode = SyncMode::IntervalMs(u64::MAX);
+        let engine = Engine::open(cfg).unwrap();
+
+        // Write 5 batches with gaps > flush_interval so each produces a
+        // separate SST via the background flush.
+        for i in 0..5u64 {
+            engine
+                .write_batch(&[make_record(&format!("k{}", i), i as i64)])
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        // Wait for several compaction cycles to fire (100ms each).
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        let sst_count = {
+            let mf = engine.manifest.lock();
+            mf.state().sstables.len()
+        };
+        assert!(
+            sst_count <= 2,
+            "compaction should have fired independently of GC; sst_count={}",
+            sst_count
+        );
+
+        // Data integrity: all records survived compaction.
+        let results = engine.query_by_prefix("k").unwrap();
+        assert_eq!(results.len(), 5);
+
+        engine.shutdown().unwrap();
+    }
+
+    /// When `compaction_interval_ms` is very large, SSTs should accumulate
+    /// without being compacted. This verifies the interval is respected and
+    /// compaction does not run spuriously.
+    #[test]
+    fn test_background_compaction_respects_large_interval() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = make_config(dir.path());
+        cfg.auto_background = true;
+        cfg.flush_interval_ms = 10;
+        cfg.compaction_interval_ms = 999_999;
+        cfg.gc_interval_secs = 999_999;
+        cfg.compaction_threshold = 2;
+        cfg.wal_sync_mode = SyncMode::IntervalMs(u64::MAX);
+        let engine = Engine::open(cfg).unwrap();
+
+        for i in 0..5u64 {
+            engine
+                .write_batch(&[make_record(&format!("k{}", i), i as i64)])
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        // Short wait — not enough for the 999_999ms compaction interval.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let sst_count = {
+            let mf = engine.manifest.lock();
+            mf.state().sstables.len()
+        };
+        assert!(
+            sst_count >= 4,
+            "large compaction interval should prevent frequent compaction; sst_count={}",
+            sst_count
+        );
+
         engine.shutdown().unwrap();
     }
 

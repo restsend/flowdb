@@ -211,6 +211,7 @@ let config = Config {
 | `block_size` | `8192` | SST block size (bytes) |
 | `bloom_bits_per_key` | `10` | Bloom filter bits per key |
 | `compaction_threshold` | `2` | SST file count to trigger compaction |
+| `compaction_interval_ms` | `60000` | Background compaction interval (ms), independent of `gc_interval_secs` |
 | `flush_interval_ms` | `1000` | Background flush interval (ms) |
 | `gc_interval_secs` | `3600` | Garbage collection interval (s) |
 | `time_bucket_secs` | `3600` | Time bucket width for block index (max ~9.22e12) |

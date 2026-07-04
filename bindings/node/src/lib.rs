@@ -52,6 +52,7 @@ pub struct JsConfig {
     pub memtable_size_mb: Option<i64>,
     pub block_cache_capacity_mb: Option<i64>,
     pub bloom_bits_per_key: Option<i64>,
+    pub compaction_interval_ms: Option<i64>,
 }
 
 // ── FlowDb ──────────────────────────────────────────────────────────
@@ -87,6 +88,10 @@ impl FlowDb {
         if let Some(v) = config.bloom_bits_per_key {
             if v <= 0 { return Err(napi::Error::from_reason("bloom_bits_per_key must be > 0")); }
             cfg.bloom_bits_per_key = v as usize;
+        }
+        if let Some(v) = config.compaction_interval_ms {
+            if v <= 0 { return Err(napi::Error::from_reason("compaction_interval_ms must be > 0")); }
+            cfg.compaction_interval_ms = v as u64;
         }
         let db = JsonDB::open(cfg).map_err(flow_err)?;
         Ok(FlowDb {
