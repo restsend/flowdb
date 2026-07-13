@@ -95,12 +95,12 @@ impl BlockMetaIndex {
     }
 
     pub fn remove_sst(&mut self, sst_id: u32) {
-        for (_, metas) in self.by_key.iter_mut() {
+        for metas in self.by_key.values_mut() {
             metas.retain(|m| m.sst_id != sst_id);
         }
         self.by_key.retain(|_, v| !v.is_empty());
 
-        for (_, metas) in self.by_time.iter_mut() {
+        for metas in self.by_time.values_mut() {
             metas.retain(|m| m.sst_id != sst_id);
         }
         self.by_time.retain(|_, v| !v.is_empty());

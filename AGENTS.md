@@ -100,7 +100,8 @@ tests/
 benches/
   flowdb_bench.rs     – criterion micro-benchmarks
 examples/
-  flowdb-vs-rocksdb.rs – comparative benchmark vs RocksDB
+  (standalone example binaries: basic_engine, basic_jsondb, bench-storage,
+   supabase-server, supabase_example)
 
 bindings/node/         – napi-rs native Node.js addon
   src/lib.rs           – #[napi] Rust bindings (FlowDb, JsTransaction)

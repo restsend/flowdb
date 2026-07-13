@@ -41,7 +41,6 @@ flowdb-derive = { version = "0.7.6", path = "flowdb-derive" }
 tempfile = "3"
 criterion = "0.8.2"
 arbitrary = { version = "1", features = ["derive"] }
-rocksdb = "0.24"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }

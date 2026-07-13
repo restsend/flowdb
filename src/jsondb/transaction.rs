@@ -6,26 +6,33 @@ use crate::jsondb::helpers::*;
 use crate::jsondb::schema::*;
 use crate::record::{InternalRecord, Record, ScanRange};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Bound;
 
+/// Type alias for the OCC read-set entry.
+type ReadSet = HashMap<(String, Vec<u8>), Option<Vec<u8>>>;
+
 // ── Transaction ───────────────────────────────────────────────────
 
-/// An explicit JsonDB transaction.
-///
-/// Writes are buffered in memory until [`commit`](Transaction::commit) is
-/// called, at which point all document and index updates are applied as a
-/// single atomic batch.
-///
-/// Dropping the transaction without calling `commit` **discards** all
-/// buffered writes — there is no automatic roll-back needed.
 /// An explicit JsonDB transaction.
 ///
 /// Created via [`JsonDB::transaction`]. All writes are buffered in memory until
 /// [`commit`](Self::commit) is called, which applies them atomically in a single
 /// batch. Dropping the transaction without calling `commit` discards all buffered
 /// writes (equivalent to a rollback).
+///
+/// # Isolation
+///
+/// Transactions provide **MVCC snapshot isolation**: reads see a consistent
+/// point-in-time snapshot captured at `BEGIN` (via `Engine::last_seq`).
+/// Records written after the snapshot are invisible to the transaction.
+///
+/// At commit time, **OCC (Optimistic Concurrency Control)** validates that
+/// no key the transaction read has been modified by a concurrent writer.
+/// If a conflict is detected, `commit` returns an error and the caller may
+/// retry the transaction.
 ///
 /// # Read-Your-Writes
 ///
@@ -48,8 +55,13 @@ use std::ops::Bound;
 pub struct Transaction<'db> {
     pub(crate) db: &'db JsonDB,
     pub(crate) mode: TransactionMode,
+    // MVCC snapshot: all reads see only records with seq ≤ snapshot_seq.
+    pub(crate) snapshot_seq: u64,
     // (store_name, primary_key_bytes) -> Some(doc_bytes) | None (delete)
     pub(crate) writes: HashMap<(String, Vec<u8>), Option<Vec<u8>>>,
+    // OCC read-set: keys read from the engine and their observed value.
+    // Validated at commit time to detect concurrent modifications.
+    pub(crate) read_set: RefCell<ReadSet>,
     // Counter records (auto-increment) that must be committed atomically
     // with the document writes.
     pub(crate) counter_updates: Vec<InternalRecord>,
@@ -108,7 +120,12 @@ impl<'db> Transaction<'db> {
                     store
                 )));
             }
-        } else if self.db.engine.get_bytes(&doc_key(store, &key_bytes), 0).is_some() {
+        } else if self
+            .db
+            .engine
+            .get_bytes_seq(&doc_key(store, &key_bytes), 0, self.snapshot_seq)
+            .is_some()
+        {
             return Err(FlowError::JsonDb(format!(
                 "key already exists in store '{}'",
                 store
@@ -128,7 +145,7 @@ impl<'db> Transaction<'db> {
 
         // Scan existing keys and mark each as deleted in the write buffer.
         let pfx = doc_prefix(store);
-        let iter = self.db.engine.scan(prefix_range(&pfx))?;
+        let iter = self.db.engine.scan_seq(prefix_range(&pfx), self.snapshot_seq)?;
         for r in iter {
             let rec = r?;
             let key_bytes = rec.key[pfx.len()..].to_vec();
@@ -151,7 +168,7 @@ impl<'db> Transaction<'db> {
     /// Retrieve a document by primary key.
     ///
     /// Reads from the transaction's write buffer first (read-your-writes),
-    /// falling back to the engine.
+    /// falling back to the engine with MVCC snapshot isolation.
     pub fn get(&self, store: &str, key: &Value) -> Result<Option<Value>> {
         let _ = self.require_store(store)?;
         let key_bytes = encode_primary_key(key)?;
@@ -164,8 +181,15 @@ impl<'db> Transaction<'db> {
             };
         }
 
-        // Fall back to engine.
-        let rec = self.db.engine.get_bytes(&doc_key(store, &key_bytes), 0);
+        // Fall back to engine (MVCC snapshot read).
+        let rec = self
+            .db
+            .engine
+            .get_bytes_seq(&doc_key(store, &key_bytes), 0, self.snapshot_seq);
+        let val_bytes = rec.as_ref().map(|r| r.value.clone());
+        self.read_set
+            .borrow_mut()
+            .insert((store.to_string(), key_bytes), val_bytes);
         match rec {
             Some(r) => Ok(Some(decode_doc(&r.value)?)),
             None => Ok(None),
@@ -185,7 +209,7 @@ impl<'db> Transaction<'db> {
     pub fn count(&self, store: &str) -> Result<usize> {
         let _ = self.require_store(store)?;
         let pfx = doc_prefix(store);
-        let iter = self.db.engine.scan(prefix_range(&pfx))?;
+        let iter = self.db.engine.scan_seq(prefix_range(&pfx), self.snapshot_seq)?;
         let mut count = 0usize;
         for r in iter {
             let rec = r?;
@@ -206,8 +230,13 @@ impl<'db> Transaction<'db> {
             if doc_opt.is_none() {
                 continue;
             }
-            // Check if it already was counted by the scan.
-            if self.db.engine.get_bytes(&doc_key(store, k), 0).is_none() {
+            // Check if it already was counted by the scan (MVCC snapshot).
+            if self
+                .db
+                .engine
+                .get_bytes_seq(&doc_key(store, k), 0, self.snapshot_seq)
+                .is_none()
+            {
                 count += 1;
             }
         }
@@ -218,7 +247,7 @@ impl<'db> Transaction<'db> {
     pub fn scan(&self, store: &str) -> Result<Vec<Value>> {
         let _ = self.require_store(store)?;
         let pfx = doc_prefix(store);
-        let iter = self.db.engine.scan(prefix_range(&pfx))?;
+        let iter = self.db.engine.scan_seq(prefix_range(&pfx), self.snapshot_seq)?;
         let mut docs = Vec::new();
         for r in iter {
             let rec = r?;
@@ -237,7 +266,11 @@ impl<'db> Transaction<'db> {
                 continue;
             }
             if let Some(bytes) = doc_opt
-                && self.db.engine.get_bytes(&doc_key(store, k), 0).is_none()
+                && self
+                    .db
+                    .engine
+                    .get_bytes_seq(&doc_key(store, k), 0, self.snapshot_seq)
+                    .is_none()
             {
                 docs.push(decode_doc(bytes)?);
             }
@@ -258,7 +291,7 @@ impl<'db> Transaction<'db> {
 
         let encoded = encode_index_value(value);
         let pfx = idx_value_prefix(store, index, &encoded);
-        let iter = self.db.engine.scan(prefix_range(&pfx))?;
+        let iter = self.db.engine.scan_seq(prefix_range(&pfx), self.snapshot_seq)?;
         let mut docs = Vec::new();
 
         // Find the index key_path for field checking.
@@ -282,7 +315,11 @@ impl<'db> Transaction<'db> {
                         docs.push(buffered_doc);
                     }
                 }
-            } else if let Some(doc) = self.db.engine.get_bytes(&doc_key(store, key_bytes), 0) {
+            } else if let Some(doc) = self.db.engine.get_bytes_seq(
+                &doc_key(store, key_bytes),
+                0,
+                self.snapshot_seq,
+            ) {
                 docs.push(decode_doc(&doc.value)?);
             }
         }
@@ -340,7 +377,7 @@ impl<'db> Transaction<'db> {
             ts_end: Bound::Unbounded,
         };
 
-        let iter = self.db.engine.scan(range)?;
+        let iter = self.db.engine.scan_seq(range, self.snapshot_seq)?;
         let mut docs = Vec::new();
 
         for r in iter {
@@ -358,7 +395,11 @@ impl<'db> Transaction<'db> {
                         }
                     }
                 }
-            } else if let Some(doc) = self.db.engine.get_bytes(&doc_key(store, key_bytes), 0) {
+            } else if let Some(doc) = self.db.engine.get_bytes_seq(
+                &doc_key(store, key_bytes),
+                0,
+                self.snapshot_seq,
+            ) {
                 docs.push(decode_doc(&doc.value)?);
             }
         }
@@ -372,7 +413,7 @@ impl<'db> Transaction<'db> {
                 if self
                     .db
                     .engine
-                    .get_bytes(&doc_key(store, key_bytes), 0)
+                    .get_bytes_seq(&doc_key(store, key_bytes), 0, self.snapshot_seq)
                     .is_some()
                 {
                     continue;
@@ -430,9 +471,34 @@ impl<'db> Transaction<'db> {
     }
 
     /// Commit all buffered writes atomically.
+    ///
+    /// Acquires the `write_lock` to serialise against direct `put`/`delete`
+    /// operations, validates the OCC read-set (detecting concurrent
+    /// modifications), and applies all writes in a single atomic batch.
     pub fn commit(mut self) -> Result<()> {
         if self.committed {
             return Ok(());
+        }
+
+        // Acquire write_lock so no direct put/delete or concurrent commit
+        // can race with our index-maintenance reads and atomic batch.
+        let _wl = self.db.write_lock.lock().unwrap();
+
+        // OCC validation: verify that every key we read still has the
+        // same value as at our snapshot.  If any key changed, abort.
+        for ((store, key), expected) in self.read_set.borrow().iter() {
+            let current = self
+                .db
+                .engine
+                .get_bytes(&doc_key(store, key), 0)
+                .map(|r| r.value);
+            if &current != expected {
+                return Err(FlowError::JsonDb(format!(
+                    "transaction conflict: key in store '{}' was modified by a concurrent \
+                     transaction (snapshot seq {}, OCC validation failed)",
+                    store, self.snapshot_seq,
+                )));
+            }
         }
 
         let mut records = Vec::new();
@@ -558,6 +624,22 @@ impl<'db> Transaction<'db> {
     }
 
     // ── helpers ──────────────────────────────────────────────────
+
+    /// Override the snapshot sequence number.  Used by language bindings
+    /// that capture the snapshot at transaction *creation* time (before
+    /// any reads or writes) rather than at the Rust `Transaction` constructor.
+    pub fn set_snapshot_seq(&mut self, seq: u64) {
+        self.snapshot_seq = seq;
+    }
+
+    /// Inject a read-set entry from an external source (language bindings
+    /// that perform reads outside the Rust `Transaction` but still need
+    /// OCC validation at commit time).
+    pub fn add_read_entry(&self, store: &str, key: Vec<u8>, value: Option<Vec<u8>>) {
+        self.read_set
+            .borrow_mut()
+            .insert((store.to_string(), key), value);
+    }
 
     fn require_read_write(&self) -> Result<()> {
         if self.mode == TransactionMode::ReadOnly {

@@ -194,12 +194,14 @@ cargo run --example supabase-server   # then open http://localhost:3000
 - Engine stats — structured counters + Prometheus-format metrics
 
 ### JsonDB (IndexedDB-compatible layer)
-- **ACID transactions** with atomic batch commit (OCC optimistic concurrency)
+- **ACID transactions** with atomic batch commit, MVCC snapshot isolation, and OCC conflict detection
 - **Secondary indexes** with automatic maintenance on CRUD
 - **Unique constraint** enforcement on indexed fields
 - Auto-increment primary keys
 - Read-your-writes consistency within transactions
-- Snapshot isolation via MVCC sequence numbers
+- **Snapshot isolation** via MVCC sequence numbers — repeatable reads within a transaction
+- **OCC conflict detection** — concurrent modifications to read keys are detected at commit time
+- **Cross-crash batch atomicity** — WAL batch-commit markers ensure all-or-nothing recovery
 - Schema persistence across restarts (automatic recovery)
 - **Full IndexedDB-compatible API** — `add`, `clear`, `getAll`, `getAllKeys`, `getKey`, `count(query?)`, `openCursor`
 - **KeyRange** factory — `KeyRange.only()`, `.bound()`, `.lowerBound()`, `.upperBound()`

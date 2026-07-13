@@ -2312,4 +2312,287 @@ mod tests {
 
         assert_eq!(db.count("users").unwrap(), 0);
     }
+
+    // ── MVCC snapshot isolation tests ───────────────────────────────
+
+    #[test]
+    fn test_mvcc_snapshot_repeatable_read() {
+        // A transaction should see the same value throughout its lifetime,
+        // even if other writers commit changes.
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1", "name": "Alice"})).unwrap();
+
+        let tx = db
+            .transaction(&["users"], TransactionMode::ReadOnly)
+            .unwrap();
+
+        // Read before external modification.
+        let doc1 = tx.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(doc1["name"], "Alice");
+
+        // External modification (direct put, not through the transaction).
+        db.put("users", json!({"id": "u1", "name": "Bob"})).unwrap();
+
+        // Read after external modification — should still see the snapshot value.
+        let doc2 = tx.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(
+            doc2["name"], "Alice",
+            "MVCC snapshot: transaction should see the snapshot value, not the latest"
+        );
+    }
+
+    #[test]
+    fn test_mvcc_snapshot_hides_uncommitted_writes() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1", "v": 1})).unwrap();
+
+        // T1 begins and reads.
+        let tx1 = db
+            .transaction(&["users"], TransactionMode::ReadOnly)
+            .unwrap();
+        let doc = tx1.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(doc["v"], 1);
+
+        // External write of v=2.
+        db.put("users", json!({"id": "u1", "v": 2})).unwrap();
+
+        // T2 begins after the external write.
+        let tx2 = db
+            .transaction(&["users"], TransactionMode::ReadOnly)
+            .unwrap();
+        let doc2 = tx2.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(doc2["v"], 2, "new transaction should see latest committed");
+
+        // T1 still sees v=1.
+        let doc1 = tx1.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(doc1["v"], 1, "old transaction should still see snapshot");
+    }
+
+    #[test]
+    fn test_mvcc_read_your_writes() {
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+
+        let mut tx = db
+            .transaction(&["users"], TransactionMode::ReadWrite)
+            .unwrap();
+        tx.put("users", json!({"id": "u1", "name": "Alice"})).unwrap();
+
+        // Should see our own uncommitted write.
+        let doc = tx.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(doc["name"], "Alice");
+
+        tx.commit().unwrap();
+        assert_eq!(db.count("users").unwrap(), 1);
+    }
+
+    // ── OCC conflict detection tests ───────────────────────────────
+
+    #[test]
+    fn test_occ_conflict_concurrent_modification() {
+        // If a transaction reads a key and another writer modifies it
+        // before commit, the commit should fail (OCC conflict).
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1", "name": "Alice"})).unwrap();
+
+        let tx = db
+            .transaction(&["users"], TransactionMode::ReadWrite)
+            .unwrap();
+
+        // Read the document (tracked in OCC read-set).
+        let doc = tx.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(doc["name"], "Alice");
+
+        // External concurrent modification.
+        db.put("users", json!({"id": "u1", "name": "Bob"})).unwrap();
+
+        // Attempt to commit — should fail due to OCC conflict.
+        let result = tx.commit();
+        assert!(
+            result.is_err(),
+            "commit should fail with OCC conflict when a read key was modified"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("conflict"),
+            "error should mention conflict, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_occ_no_conflict_disjoint_keys() {
+        // Two transactions writing disjoint keys should both succeed.
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1", "name": "Alice"})).unwrap();
+        db.put("users", json!({"id": "u2", "name": "Bob"})).unwrap();
+
+        // T1 reads u1 and writes u1.
+        let mut tx1 = db
+            .transaction(&["users"], TransactionMode::ReadWrite)
+            .unwrap();
+        let _doc = tx1.get("users", &json!("u1")).unwrap().unwrap();
+        tx1.put("users", json!({"id": "u1", "name": "Alice2"})).unwrap();
+        tx1.commit().unwrap();
+
+        // T2 reads u2 and writes u2 (disjoint from T1).
+        let mut tx2 = db
+            .transaction(&["users"], TransactionMode::ReadWrite)
+            .unwrap();
+        let _doc = tx2.get("users", &json!("u2")).unwrap().unwrap();
+        tx2.put("users", json!({"id": "u2", "name": "Bob2"})).unwrap();
+        tx2.commit().unwrap();
+
+        // Both commits should have succeeded.
+        let doc1 = db.get("users", &json!("u1")).unwrap().unwrap();
+        assert_eq!(doc1["name"], "Alice2");
+        let doc2 = db.get("users", &json!("u2")).unwrap().unwrap();
+        assert_eq!(doc2["name"], "Bob2");
+    }
+
+    #[test]
+    fn test_occ_no_conflict_write_only() {
+        // A transaction that only writes (no reads of existing data)
+        // should not have OCC conflicts.
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+
+        let mut tx = db
+            .transaction(&["users"], TransactionMode::ReadWrite)
+            .unwrap();
+        tx.put("users", json!({"id": "u1", "name": "Alice"})).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(db.count("users").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_occ_conflict_on_delete() {
+        // If a transaction reads a key and another writer deletes it,
+        // the commit should fail.
+        let (db, _dir) = test_db();
+        db.create_object_store("users", "id").unwrap();
+        db.put("users", json!({"id": "u1", "name": "Alice"})).unwrap();
+
+        let tx = db
+            .transaction(&["users"], TransactionMode::ReadWrite)
+            .unwrap();
+        let _doc = tx.get("users", &json!("u1")).unwrap().unwrap();
+
+        // External concurrent deletion.
+        db.delete("users", &json!("u1")).unwrap();
+
+        let result = tx.commit();
+        assert!(result.is_err(), "commit should fail when read key was deleted");
+    }
+
+    // ── Flush-gap consistency test ─────────────────────────────────
+
+    #[test]
+    fn test_flush_gap_records_remain_visible() {
+        // During a flush, records should remain visible to readers.
+        // This tests the flushing-list mechanism.
+        use crate::record::Record;
+
+        let dir = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: dir.path().to_path_buf(),
+            auto_background: false,
+            wal_sync_mode: crate::record::SyncMode::IntervalMs(u64::MAX),
+            memtable_size_mb: 64,
+            ..Default::default()
+        };
+        let engine = crate::engine::Engine::open(cfg).unwrap();
+
+        // Write a record.
+        engine.write_batch_owned(vec![Record::new("key1", 1, b"value1".to_vec())]).unwrap();
+
+        // Manually move the memtable to the flushing state.
+        let memtables = engine.memtables_ref();
+        assert!(memtables.freeze());
+        let records = memtables.pop_frozen_to_flushing().unwrap();
+        assert!(!records.is_empty(), "should have records in flushing");
+
+        // The record should still be queryable while in the flushing list.
+        let found = memtables.get(b"key1", 1, i64::MAX);
+        assert!(found.is_some(), "record should be visible during flush (in flushing list)");
+
+        // Also check query_prefix sees flushing records.
+        let prefix_results = memtables.query_prefix(b"key1", i64::MAX);
+        assert!(!prefix_results.is_empty(), "scan should see flushing records");
+
+        // Complete the flush.
+        memtables.complete_flush();
+
+        // After complete_flush, the flushing list is empty.
+        // The record is no longer in any memtable (it was never written to SST).
+        let not_found = memtables.get(b"key1", 1, i64::MAX);
+        assert!(not_found.is_none(), "record should be gone after flush completes");
+
+        engine.shutdown().unwrap();
+    }
+
+    // ── Cross-crash durability test ────────────────────────────────
+
+    #[test]
+    fn test_durability_survives_shutdown_reopen() {
+        let dir = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: dir.path().to_path_buf(),
+            auto_background: false,
+            wal_sync_mode: crate::record::SyncMode::Always,
+            ..Default::default()
+        };
+
+        // Write and shut down.
+        {
+            let db = JsonDB::open(cfg.clone()).unwrap();
+            db.create_object_store("kv", "id").unwrap();
+            db.put("kv", json!({"id": "k1", "v": 42})).unwrap();
+            db.shutdown().unwrap();
+        }
+
+        // Reopen — data must survive.
+        {
+            let db = JsonDB::open(cfg).unwrap();
+            let doc = db.get("kv", &json!("k1")).unwrap().unwrap();
+            assert_eq!(doc["v"], 42);
+        }
+    }
+
+    #[test]
+    fn test_durability_batch_atomicity_on_replay() {
+        // Multiple records in a batch should all survive or none.
+        let dir = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: dir.path().to_path_buf(),
+            auto_background: false,
+            wal_sync_mode: crate::record::SyncMode::Always,
+            ..Default::default()
+        };
+
+        {
+            let db = JsonDB::open(cfg.clone()).unwrap();
+            db.create_object_store("kv", "id").unwrap();
+
+            let mut tx = db.transaction(&["kv"], TransactionMode::ReadWrite).unwrap();
+            tx.put("kv", json!({"id": "a", "v": 1})).unwrap();
+            tx.put("kv", json!({"id": "b", "v": 2})).unwrap();
+            tx.put("kv", json!({"id": "c", "v": 3})).unwrap();
+            tx.commit().unwrap();
+            db.shutdown().unwrap();
+        }
+
+        {
+            let db = JsonDB::open(cfg).unwrap();
+            assert_eq!(db.count("kv").unwrap(), 3);
+            assert_eq!(db.get("kv", &json!("a")).unwrap().unwrap()["v"], 1);
+            assert_eq!(db.get("kv", &json!("b")).unwrap().unwrap()["v"], 2);
+            assert_eq!(db.get("kv", &json!("c")).unwrap().unwrap()["v"], 3);
+        }
+    }
 }

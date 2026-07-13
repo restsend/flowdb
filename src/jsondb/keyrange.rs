@@ -7,31 +7,21 @@ use std::ops::Bound;
 ///
 /// # Factories
 ///
-/// ```ignore
-/// use flowdb::jsondb::KeyRange;
-///
-/// KeyRange::only(json!("alice"));
-/// KeyRange::bound(json!("a"), json!("z"), false, false); // [a, z]
-/// KeyRange::lower_bound(json!(18), false);               // [18, +inf)
-/// KeyRange::upper_bound(json!(65), true);                 // (-inf, 65)
 /// ```
-#[derive(Debug, Clone)]
+/// use flowdb::jsondb::KeyRange;
+/// use serde_json::json;
+///
+/// let _ = KeyRange::only(json!("alice"));
+/// let _ = KeyRange::bound(json!("a"), json!("z"), false, false); // [a, z]
+/// let _ = KeyRange::lower_bound(json!(18), false);               // [18, +inf)
+/// let _ = KeyRange::upper_bound(json!(65), true);                // (-inf, 65)
+/// ```
+#[derive(Debug, Clone, Default)]
 pub struct KeyRange {
     pub lower: Option<Value>,
     pub upper: Option<Value>,
     pub lower_open: bool,
     pub upper_open: bool,
-}
-
-impl Default for KeyRange {
-    fn default() -> Self {
-        Self {
-            lower: None,
-            upper: None,
-            lower_open: false,
-            upper_open: false,
-        }
-    }
 }
 
 impl KeyRange {

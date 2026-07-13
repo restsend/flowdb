@@ -17,7 +17,7 @@ https://github.com/restsend/flowdb
 
 ## 一、先看结果：FlowDB 的性能表现到了什么水平
 
-项目自带了和 RocksDB 的对比基准，测试代码在 `examples/flowdb-vs-rocksdb.rs`。默认条件是：
+README 中给出了和 RocksDB 的对比基准。默认条件是：
 
 - 100K records
 - value 大小 128B

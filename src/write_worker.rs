@@ -44,8 +44,15 @@ impl WriteWorker {
         }
     }
 
+    #[allow(dead_code)]
     pub fn flush_wal(&mut self) -> Result<()> {
         self.wal.flush()
+    }
+
+    /// fsync the WAL and its parent directory so all acknowledged writes
+    /// are durable on disk.  Called during `Engine::close` / `shutdown`.
+    pub fn sync_wal(&mut self) -> Result<()> {
+        self.wal.sync_all()
     }
 
     /// Core write: WAL + memtable insert (no fsync). Used by both
@@ -112,19 +119,20 @@ impl WriteWorker {
     pub fn do_flush(&mut self) -> Result<()> {
         let _did_freeze = self.memtables.freeze();
 
-        let frozen = self.memtables.pop_frozen();
-
-        let frozen = match frozen {
-            Some(f) => f,
+        // Atomically move the oldest frozen memtable into the *flushing*
+        // list (still queryable) and collect its sorted records.
+        let all_records = match self.memtables.pop_frozen_to_flushing() {
+            Some(r) => r,
             None => return Ok(()),
         };
 
         let start = std::time::Instant::now();
-        let mut all_records: Vec<InternalRecord> = frozen.iter_sorted().cloned().collect();
         let now_us = now_micros();
+        let mut all_records = all_records;
         all_records.retain(|r| r.expire_at > now_us);
 
         if all_records.is_empty() {
+            self.memtables.complete_flush();
             self.stats.set_frozen_count(self.memtables.frozen_count());
             return Ok(());
         }
@@ -183,6 +191,10 @@ impl WriteWorker {
             idx.add_sst(sst_id, &block_infos);
             idx.set_bloom(sst_id, bloom);
         }
+
+        // The SST is now registered in the index — safe to remove the
+        // memtable from the flushing list so it can finally be dropped.
+        self.memtables.complete_flush();
 
         {
             if let Err(e) = self.wal.truncate_before(last_seq) {

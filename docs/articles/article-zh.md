@@ -92,20 +92,23 @@ JsonDB 的事务采用 **乐观并发控制（OCC）** + **MVCC 快照隔离**�
 
 ```
 BEGIN:
-  记录 snapshot_seq = engine.seq_counter
+  记录 snapshot_seq = engine.last_seq()  // committed_seq 原子量
 
 READ:
-  写缓冲优先 → 引擎后备
+  写缓冲优先 → 引擎后备（get_bytes_seq）
   引擎层过滤掉 seq > snapshot_seq 的记录
+  记录 (key, value) 到 OCC 读集
 
 WRITE:
   仅本地缓冲（HashMap），不写入引擎
 
 COMMIT:
-  1. 唯一约束校验（检查引擎 + 写缓冲）
-  2. 构建 batch：删除旧索引 + 写入文档 + 写入新索引 + 计数器更新
-  3. engine.write_internal() — 原子写入 WAL + MemTable
-  4. 标记 committed = true（仅在成功后）
+  1. 获取 write_lock（与直接 put/delete 串行化）
+  2. OCC 校验：重新读取读集中的每个 key，若已变更则中止
+  3. 唯一约束校验（检查引擎 + 写缓冲）
+  4. 构建 batch：删除旧索引 + 写入文档 + 写入新索引 + 计数器更新
+  5. engine.write_internal() — 原子写入 WAL + MemTable
+  6. 标记 committed = true（仅在成功后）
 ```
 
 ### 4.2 与 IndexedDB 的隔离级别对比
@@ -114,8 +117,8 @@ COMMIT:
 |------|-----------|---------------|
 | 事务模式 | ReadOnly / ReadWrite | ReadOnly / ReadWrite |
 | 隔离级别 | Snapshot Isolation | Snapshot Isolation (OCC) |
-| 写冲突检测 | 悲观锁（per-store） | 乐观冲突检测（OCC） |
-| 原子性 | per-request | per-batch（write_internal） |
+| 写冲突检测 | 悲观锁（per-store） | 乐观冲突检测（OCC + write_lock） |
+| 原子性 | per-request | per-batch（write_internal + WAL 提交标记） |
 | 自动回滚 | 事务超时 / abort | Drop Transaction（自动丢弃缓冲） |
 
 ### 4.3 崩溃安全
@@ -131,13 +134,17 @@ engine.write_internal(&[
 ])?;
 // 上述批次要么全部持久化，要么全部不写
 // SyncMode::Always 模式下每个批次后 fsync
+// WAL 批次提交标记确保跨崩溃原子性
 ```
 
-WAL 使用 **FxHash checksums** 校验每个记录。崩溃恢复时：
+WAL 使用 **FxHash checksums** 校验每个记录，并使用**批次提交标记（BatchCommit marker）**确保跨崩溃原子性。崩溃恢复时：
 1. 读取所有 WAL segments
-2. 校验 checksum，截断尾部损坏数据
-3. 过滤掉 `seq <= last_flushed_seq` 的记录
-4. 重新写入 MemTable
+2. 解码记录，跟踪待提交批次
+3. 遇到 BatchCommit 标记时，将待提交记录提升为已提交
+4. 若无任何标记（旧格式），所有记录均视为已提交（向后兼容）
+5. 最后一个标记之后的记录（未提交）被丢弃
+6. 过滤掉 `seq <= last_flushed_seq` 的记录
+7. 重新写入 MemTable
 
 ## 五、二级索引与复合查询
 

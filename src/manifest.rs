@@ -129,8 +129,7 @@ impl Manifest {
                             return Err(crate::error::FlowError::Corruption {
                                 file: path.display().to_string(),
                                 msg: format!("Corrupted manifest entry at line {}: {}", i + 1, e),
-                            }
-                            .into());
+                            });
                         }
                     }
                 }

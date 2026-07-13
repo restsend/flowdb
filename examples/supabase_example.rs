@@ -12,7 +12,7 @@
 //!   - Compound index queries ("my open todos, ordered by priority")
 //!   - Schema defined via #[derive(ObjectStore)] macro
 
-use flowdb::jsondb::{JsonDB, KeyRange, TransactionMode};
+use flowdb::jsondb::{JsonDB, TransactionMode};
 use flowdb::{Config, ObjectStore};
 use serde_json::Value;
 

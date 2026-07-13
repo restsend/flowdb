@@ -83,6 +83,10 @@ pub enum Op {
     Delete = 1,
     /// Delete all records with keys in `[key, range_end)`.
     DeleteRange = 2,
+    /// WAL-only batch commit marker.  Appended after the last record in a
+    /// batch so recovery can distinguish a fully-fsync'd batch from a
+    /// truncated one.  Never appears in SSTables or the memtable.
+    BatchCommit = 3,
 }
 
 impl Op {
@@ -90,6 +94,7 @@ impl Op {
         match v {
             1 => Op::Delete,
             2 => Op::DeleteRange,
+            3 => Op::BatchCommit,
             _ => Op::Put,
         }
     }
@@ -184,7 +189,8 @@ pub enum SyncMode {
     Always,
     /// fsync the WAL on a periodic tick (milliseconds). Balances durability
     /// with throughput by coalescing multiple batches into a single fsync.
-    /// Requires the background maintenance task to be running.
+    /// Requires the background maintenance task (`auto_background = true`)
+    /// to be running; otherwise the WAL is only fsynced on `Engine::close`.
     IntervalMs(u64),
 }
 
@@ -193,19 +199,14 @@ pub enum SyncMode {
 /// Use `Config::default()` for sensible defaults, or construct inline:
 ///
 /// Selects the on-disk storage backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackendKind {
     /// One `.sst` file per SST — the classic multi-file layout.
+    #[default]
     MultiFile,
     /// All SSTs packed inside a single `.db` container file.
     SingleFile,
-}
-
-impl Default for StorageBackendKind {
-    fn default() -> Self {
-        Self::MultiFile
-    }
 }
 
 /// ```no_run

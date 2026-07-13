@@ -233,10 +233,22 @@ impl<'a> QueryBuilder<'a> {
 
     /// Execute the query and deserialize results to `T`.
     ///
-    /// ```ignore
+    /// ```no_run
+    /// use flowdb::jsondb::{JsonDB, StoreSchema};
+    /// use serde_json::json;
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Deserialize, Serialize)]
+    /// struct User { id: String, email: String }
+    ///
+    /// let db = JsonDB::open(Default::default()).unwrap();
+    /// db.apply_store(&StoreSchema::new("users", "id")
+    ///     .with_index("by_email", &["email"], true)).unwrap();
+    /// db.put("users", json!({"id": "u1", "email": "a@b.com"})).unwrap();
+    ///
     /// let users: Vec<User> = db.query("users")
-    ///     .where_eq("email", "a@b.com")
-    ///     .collect_doc()?;
+    ///     .where_eq("email", json!("a@b.com"))
+    ///     .collect_doc().unwrap();
     /// ```
     pub fn collect_doc<T: serde::de::DeserializeOwned>(self) -> Result<Vec<T>> {
         let values: Vec<Value> = self.collect()?;

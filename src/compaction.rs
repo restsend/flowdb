@@ -151,13 +151,17 @@ impl CompactionRunner {
         if records_written == 0 {
             for sst_id in &candidates {
                 self.cache.invalidate_sst(*sst_id);
+                {
+                    let mut mf = self.manifest.lock();
+                    mf.append(&ManifestEntry::GcDeleteSst { sst_id: *sst_id })?;
+                }
+                {
+                    let mut idx = self.index.write();
+                    idx.remove_sst(*sst_id);
+                }
                 if let Err(e) = self.storage.delete_sst(*sst_id) {
                     tracing::warn!("Compaction: failed to delete SST {}: {}", sst_id, e);
                 }
-                let mut idx = self.index.write();
-                idx.remove_sst(*sst_id);
-                let mut mf = self.manifest.lock();
-                mf.append(&ManifestEntry::GcDeleteSst { sst_id: *sst_id })?;
             }
             self.refresh_stats();
             return Ok(true);

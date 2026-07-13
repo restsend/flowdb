@@ -90,20 +90,23 @@ JsonDB transactions use **Optimistic Concurrency Control (OCC)** with **MVCC sna
 
 ```
 BEGIN:
-  Record snapshot_seq = engine.seq_counter
+  Record snapshot_seq = engine.last_seq()  // committed_seq atomic
 
 READ:
-  Write buffer first → engine fallback
+  Write buffer first → engine fallback (get_bytes_seq)
   Engine filters out records with seq > snapshot_seq
+  Track (key, value) in OCC read-set
 
 WRITE:
   Local buffer only (HashMap), NOT sent to engine
 
 COMMIT:
-  1. Unique constraint validation (engine + write buffer)
-  2. Build batch: delete old indexes + write doc + write new indexes + counter
-  3. engine.write_internal() — atomic write to WAL + MemTable
-  4. Mark committed = true (only after success)
+  1. Acquire write_lock (serializes vs direct put/delete)
+  2. OCC validation: re-read each read-set key, abort if changed
+  3. Unique constraint validation (engine + write buffer)
+  4. Build batch: delete old indexes + write doc + write new indexes + counter
+  5. engine.write_internal() — atomic write to WAL + MemTable
+  6. Mark committed = true (only after success)
 ```
 
 ### 4.2 Isolation Comparison with IndexedDB
@@ -112,8 +115,8 @@ COMMIT:
 |---------|-----------|---------------|
 | Transaction modes | ReadOnly / ReadWrite | ReadOnly / ReadWrite |
 | Isolation level | Snapshot Isolation | Snapshot Isolation (OCC) |
-| Conflict detection | Pessimistic (per-store lock) | Optimistic (OCC) |
-| Atomicity | per-request | per-batch (write_internal) |
+| Conflict detection | Pessimistic (per-store lock) | Optimistic (OCC + write_lock) |
+| Atomicity | per-request | per-batch (write_internal + WAL commit marker) |
 | Auto-rollback | Timeout / abort | Drop Transaction (discard buffer) |
 
 ### 4.3 Crash Safety
@@ -129,13 +132,17 @@ engine.write_internal(&[
 ])?;
 // Either ALL persisted or NONE persisted
 // SyncMode::Always: fsync after every batch
+// WAL batch-commit marker ensures cross-crash atomicity
 ```
 
-WAL uses **FxHash checksums** per record. On crash recovery:
+WAL uses **FxHash checksums** per record and **batch-commit markers** for cross-crash atomicity. On crash recovery:
 1. Read all WAL segments
-2. Verify checksums, truncate corrupted tail
-3. Filter out records with `seq <= last_flushed_seq`
-4. Re-insert to MemTable
+2. Decode records, tracking pending batches
+3. When a BatchCommit marker is found, promote pending records to committed
+4. If no markers exist (old format), all records are committed (backward-compatible)
+5. Records after the last marker (uncommitted) are discarded
+6. Filter out records with `seq <= last_flushed_seq`
+7. Re-insert to MemTable
 
 ## 5. Secondary Indexes & Composite Queries
 

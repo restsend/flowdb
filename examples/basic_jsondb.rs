@@ -215,7 +215,7 @@ fn main() {
     let mut icursor = db
         .open_cursor_on_index("users", "by_email", None, CursorDirection::Prev)
         .unwrap();
-    let (idx_val, pk, doc) = icursor.next_value().unwrap();
+    let (idx_val, pk, _doc) = icursor.next_value().unwrap();
     println!("Index cursor (prev, first): idx={:#?} pk={:#?}", idx_val, pk);
 
     // ── 18. Transaction add / clear ─────────────────────────────

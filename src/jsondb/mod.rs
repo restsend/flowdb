@@ -30,8 +30,9 @@ pub use transaction::Transaction;
 ///
 /// # Example
 ///
-/// ```ignore
-/// use flowdb::jsondb::ObjectStore;
+/// ```no_run
+/// use flowdb::ObjectStore;
+/// use flowdb::jsondb::JsonDB;
 ///
 /// #[derive(ObjectStore)]
 /// #[store(key_path = "id")]
@@ -41,6 +42,9 @@ pub use transaction::Transaction;
 ///     #[index]
 ///     age: u32,
 /// }
+///
+/// let db = JsonDB::open(Default::default()).unwrap();
+/// db.apply_schema::<User>().unwrap();
 /// ```
 pub trait ObjectStore {
     /// Returns the [`StoreDef`] for this struct, including all annotated indexes.

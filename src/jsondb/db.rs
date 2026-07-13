@@ -9,6 +9,7 @@ use crate::jsondb::schema::*;
 use crate::jsondb::{KeyArg, ObjectStore, Transaction, TransactionMode};
 use crate::record::{Config, InternalRecord, Record, ScanRange};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Bound;
@@ -62,8 +63,9 @@ pub struct JsonDB {
     pub(crate) schema: Schema,
     // Serialises read-modify-write operations (put, delete, put_auto) so
     // concurrent threads don't compute stale index maintenance from the
-    // same old-document snapshot.
-    write_lock: std::sync::Mutex<()>,
+    // same old-document snapshot.  Also acquired by `Transaction::commit`
+    // for OCC validation.
+    pub(crate) write_lock: std::sync::Mutex<()>,
 }
 
 impl fmt::Debug for JsonDB {
@@ -111,6 +113,29 @@ impl JsonDB {
     /// Access the underlying FlowDB engine.
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Returns the sequence number of the last committed write.
+    /// Used by language bindings to capture a snapshot at transaction creation.
+    pub fn last_seq(&self) -> u64 {
+        self.engine.last_seq()
+    }
+
+    /// MVCC point read: like `get` but only sees records with `seq <= max_seq`.
+    /// Used by language bindings for snapshot-isolated transaction reads.
+    pub fn get_snapshot(&self, store: &str, key: &Value, max_seq: u64) -> Result<Option<Value>> {
+        let _ = self
+            .schema
+            .get(store)
+            .ok_or_else(|| FlowError::JsonDb(format!("store '{}' not found", store)))?;
+        let key_bytes = encode_primary_key(key)?;
+        let rec = self
+            .engine
+            .get_bytes_seq(&doc_key(store, &key_bytes), 0, max_seq);
+        match rec {
+            Some(r) => Ok(Some(decode_doc(&r.value)?)),
+            None => Ok(None),
+        }
     }
 
     // ── schema management ─────────────────────────────────────────
@@ -664,10 +689,8 @@ impl JsonDB {
         for r in iter {
             let rec = r?;
             docs.push(decode_doc(&rec.value)?);
-            if let Some(n) = count {
-                if docs.len() >= n {
-                    break;
-                }
+            if count.is_some_and(|n| docs.len() >= n) {
+                break;
             }
         }
         Ok(docs)
@@ -699,10 +722,8 @@ impl JsonDB {
             if let Some(key_val) = extract_field(&doc, &def.key_path) {
                 keys.push(key_val);
             }
-            if let Some(n) = count {
-                if keys.len() >= n {
-                    break;
-                }
+            if count.is_some_and(|n| keys.len() >= n) {
+                break;
             }
         }
         Ok(keys)
@@ -862,7 +883,9 @@ impl JsonDB {
         Ok(Transaction {
             db: self,
             mode,
+            snapshot_seq: self.engine.last_seq(),
             writes: HashMap::new(),
+            read_set: RefCell::new(HashMap::new()),
             counter_updates: Vec::new(),
             next_ids: HashMap::new(),
             committed: false,
@@ -881,8 +904,16 @@ impl JsonDB {
     /// The type **must** have a field matching the store's `key_path`.
     /// Returns the extracted primary key value.
     ///
-    /// ```ignore
-    /// db.put_doc("users", &User { id: "u1".into(), name: "Alice".into() })?;
+    /// ```no_run
+    /// use flowdb::jsondb::{JsonDB, StoreSchema};
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct User { id: String, name: String }
+    ///
+    /// let db = JsonDB::open(Default::default()).unwrap();
+    /// db.apply_store(&StoreSchema::new("users", "id")).unwrap();
+    /// db.put_doc("users", &User { id: "u1".into(), name: "Alice".into() }).unwrap();
     /// ```
     pub fn put_doc<T: serde::Serialize>(&self, store: &str, doc: &T) -> Result<Value> {
         let json = serde_json::to_value(doc).map_err(FlowError::from)?;
@@ -891,8 +922,17 @@ impl JsonDB {
 
     /// Retrieve a document by primary key, deserialized to `T`.
     ///
-    /// ```ignore
-    /// let user: User = db.get_doc("users", "u1")?.unwrap();
+    /// ```no_run
+    /// use flowdb::jsondb::{JsonDB, StoreSchema};
+    /// use serde::{Deserialize, Serialize};
+    ///
+    /// #[derive(Deserialize, Serialize)]
+    /// struct User { id: String, name: String }
+    ///
+    /// let db = JsonDB::open(Default::default()).unwrap();
+    /// db.apply_store(&StoreSchema::new("users", "id")).unwrap();
+    /// db.put_doc("users", &User { id: "u1".into(), name: "Alice".into() }).unwrap();
+    /// let user: User = db.get_doc("users", "u1").unwrap().unwrap();
     /// ```
     pub fn get_doc<T: serde::de::DeserializeOwned>(
         &self,

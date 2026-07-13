@@ -63,6 +63,20 @@ impl MemTable {
             .max_by_key(|r| (r.ts, r.seq))
     }
 
+    /// Get the highest-seq record for (key, ts) with seq ≤ max_seq.
+    /// Used for MVCC snapshot reads.
+    pub fn get_with_max_seq(
+        &self,
+        key: &[u8],
+        ts: i64,
+        max_seq: u64,
+    ) -> Option<&InternalRecord> {
+        self.records
+            .iter()
+            .filter(|r| r.key.as_slice() == key && r.ts == ts && r.seq <= max_seq)
+            .max_by_key(|r| r.seq)
+    }
+
     pub fn query_prefix(&self, key: &[u8], now_us: i64) -> Vec<&InternalRecord> {
         self.records
             .iter()
@@ -186,6 +200,10 @@ fn increment_prefix(key: &[u8]) -> Vec<u8> {
 pub(crate) struct MemTables {
     active: RwLock<MemTable>,
     frozen: RwLock<Vec<MemTable>>,
+    /// Memtables currently being flushed (SST write in progress).
+    /// Kept queryable so readers don't miss records during the
+    /// pop-frozen → index-update window.
+    flushing: RwLock<Vec<MemTable>>,
     #[allow(dead_code)]
     max_frozen: usize,
     memtable_size_limit: usize,
@@ -196,6 +214,7 @@ impl MemTables {
         Self {
             active: RwLock::new(MemTable::new()),
             frozen: RwLock::new(Vec::new()),
+            flushing: RwLock::new(Vec::new()),
             max_frozen,
             memtable_size_limit,
         }
@@ -241,12 +260,37 @@ impl MemTables {
         true
     }
 
+    #[allow(dead_code)]
     pub fn pop_frozen(&self) -> Option<MemTable> {
         let mut frozen = self.frozen.write();
         if !frozen.is_empty() {
             Some(frozen.remove(0))
         } else {
             None
+        }
+    }
+
+    /// Atomically move the oldest frozen memtable into the *flushing*
+    /// list (still queryable by readers) and return its sorted records
+    /// for SST writing.  Call [`complete_flush`] once the SST has been
+    /// registered in the index so the memtable is finally dropped.
+    pub fn pop_frozen_to_flushing(&self) -> Option<Vec<InternalRecord>> {
+        let mut frozen = self.frozen.write();
+        if frozen.is_empty() {
+            return None;
+        }
+        let mt = frozen.remove(0);
+        let records: Vec<InternalRecord> = mt.iter_sorted().cloned().collect();
+        self.flushing.write().push(mt);
+        Some(records)
+    }
+
+    /// Remove the oldest flushing memtable.  Called after the SST has
+    /// been durably written and registered in the block-meta index.
+    pub fn complete_flush(&self) {
+        let mut flushing = self.flushing.write();
+        if !flushing.is_empty() {
+            flushing.remove(0);
         }
     }
 
@@ -273,6 +317,12 @@ impl MemTables {
         {
             let frozen = self.frozen.read();
             for mt in frozen.iter() {
+                results.extend(mt.query_prefix(key, now_us).iter().map(|r| (*r).clone()));
+            }
+        }
+        {
+            let flushing = self.flushing.read();
+            for mt in flushing.iter() {
                 results.extend(mt.query_prefix(key, now_us).iter().map(|r| (*r).clone()));
             }
         }
@@ -305,6 +355,16 @@ impl MemTables {
                 );
             }
         }
+        {
+            let flushing = self.flushing.read();
+            for mt in flushing.iter() {
+                results.extend(
+                    mt.query_key_range(start_key, end_key, now_us)
+                        .iter()
+                        .map(|r| (*r).clone()),
+                );
+            }
+        }
         results
     }
 
@@ -322,6 +382,16 @@ impl MemTables {
         {
             let frozen = self.frozen.read();
             for mt in frozen.iter() {
+                results.extend(
+                    mt.query_time_range(ts_start, ts_end, now_us)
+                        .iter()
+                        .map(|r| (*r).clone()),
+                );
+            }
+        }
+        {
+            let flushing = self.flushing.read();
+            for mt in flushing.iter() {
                 results.extend(
                     mt.query_time_range(ts_start, ts_end, now_us)
                         .iter()
@@ -352,6 +422,16 @@ impl MemTables {
         {
             let frozen = self.frozen.read();
             for mt in frozen.iter() {
+                results.extend(
+                    mt.query_prefix_time_range(key, ts_start, ts_end, now_us)
+                        .iter()
+                        .map(|r| (*r).clone()),
+                );
+            }
+        }
+        {
+            let flushing = self.flushing.read();
+            for mt in flushing.iter() {
                 results.extend(
                     mt.query_prefix_time_range(key, ts_start, ts_end, now_us)
                         .iter()
@@ -390,6 +470,16 @@ impl MemTables {
                 );
             }
         }
+        {
+            let flushing = self.flushing.read();
+            for mt in flushing.iter() {
+                results.extend(
+                    mt.query_key_time_range(start_key, end_key, ts_start, ts_end, now_us)
+                        .iter()
+                        .map(|r| (*r).clone()),
+                );
+            }
+        }
         results
     }
 
@@ -404,6 +494,15 @@ impl MemTables {
         }
         let frozen = self.frozen.read();
         for mt in frozen.iter() {
+            if let Some(r) = mt.get(key, ts)
+                && r.expire_at >= now_us
+            {
+                return Some(r.clone());
+            }
+        }
+        drop(frozen);
+        let flushing = self.flushing.read();
+        for mt in flushing.iter() {
             if let Some(r) = mt.get(key, ts)
                 && r.expire_at >= now_us
             {
@@ -430,6 +529,61 @@ impl MemTables {
                         || r.ts > best.as_ref().unwrap().ts
                         || (r.ts == best.as_ref().unwrap().ts
                             && r.seq > best.as_ref().unwrap().seq))
+                {
+                    best = Some(r.clone());
+                }
+            }
+        }
+        {
+            let flushing = self.flushing.read();
+            for mt in flushing.iter() {
+                if let Some(r) = mt.get_latest(key, now_us)
+                    && (best.is_none()
+                        || r.ts > best.as_ref().unwrap().ts
+                        || (r.ts == best.as_ref().unwrap().ts
+                            && r.seq > best.as_ref().unwrap().seq))
+                {
+                    best = Some(r.clone());
+                }
+            }
+        }
+        best
+    }
+
+    /// MVCC point read: highest-seq record for (key, ts) with seq ≤ max_seq.
+    pub fn get_seq(
+        &self,
+        key: &[u8],
+        ts: i64,
+        now_us: i64,
+        max_seq: u64,
+    ) -> Option<InternalRecord> {
+        let mut best: Option<InternalRecord> = None;
+        {
+            let active = self.active.read();
+            if let Some(r) = active.get_with_max_seq(key, ts, max_seq)
+                && r.expire_at >= now_us
+            {
+                best = Some(r.clone());
+            }
+        }
+        {
+            let frozen = self.frozen.read();
+            for mt in frozen.iter() {
+                if let Some(r) = mt.get_with_max_seq(key, ts, max_seq)
+                    && r.expire_at >= now_us
+                    && (best.is_none() || r.seq > best.as_ref().unwrap().seq)
+                {
+                    best = Some(r.clone());
+                }
+            }
+        }
+        {
+            let flushing = self.flushing.read();
+            for mt in flushing.iter() {
+                if let Some(r) = mt.get_with_max_seq(key, ts, max_seq)
+                    && r.expire_at >= now_us
+                    && (best.is_none() || r.seq > best.as_ref().unwrap().seq)
                 {
                     best = Some(r.clone());
                 }

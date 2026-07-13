@@ -166,8 +166,7 @@ impl Wal {
             return Err(crate::error::FlowError::Corruption {
                 file: "WAL".into(),
                 msg: "Checksum mismatch in WAL record".into(),
-            }
-            .into());
+            });
         }
 
         pos += CHECKSUM_LEN;
@@ -202,6 +201,7 @@ impl Wal {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn flush(&mut self) -> Result<()> {
         for seg in &mut self.segments {
             seg.writer.flush()?;
@@ -250,8 +250,21 @@ impl Wal {
         Ok(())
     }
 
+    /// Replay records with `seq > after_seq`, respecting batch-commit
+    /// markers for cross-crash atomicity.
+    ///
+    /// Records are collected into a *pending* buffer.  When a valid
+    /// `BatchCommit` marker is encountered, all pending records are
+    /// promoted to *committed*.  At the end:
+    /// - If **no** markers were seen at all (old WAL format), all pending
+    ///   records are committed (backward-compatible).
+    /// - If markers were seen, remaining pending records (written after
+    ///   the last marker but never fsync'd) are discarded.
     pub fn replay_from(&mut self, after_seq: u64) -> Result<Vec<InternalRecord>> {
-        let mut records = Vec::new();
+        let mut pending: Vec<InternalRecord> = Vec::new();
+        let mut committed: Vec<InternalRecord> = Vec::new();
+        let mut has_markers = false;
+
         for segment in &mut self.segments {
             segment.writer.flush()?;
             let data = std::fs::read(&segment.path)?;
@@ -259,8 +272,11 @@ impl Wal {
             while pos < data.len() {
                 match decode_record(&data[pos..]) {
                     Ok(Some((rec, advance))) => {
-                        if rec.seq > after_seq {
-                            records.push(rec);
+                        if rec.op == Op::BatchCommit {
+                            has_markers = true;
+                            committed.append(&mut pending);
+                        } else if rec.seq > after_seq {
+                            pending.push(rec);
                         }
                         pos += advance;
                     }
@@ -272,8 +288,16 @@ impl Wal {
                 }
             }
         }
-        records.sort_by_key(|r| r.seq);
-        Ok(records)
+
+        // Backward compatibility: old WAL files have no BatchCommit markers.
+        // Treat all records as committed in that case.
+        if !has_markers {
+            committed.append(&mut pending);
+        }
+        // else: uncommitted pending records (after the last marker) are discarded.
+
+        committed.sort_by_key(|r| r.seq);
+        Ok(committed)
     }
 
     pub fn truncate_before(&mut self, seq: u64) -> Result<()> {
@@ -302,17 +326,42 @@ impl Wal {
 }
 
 /// Encodes multiple records into a single binary buffer (big-endian).
-/// Pre-computes total encoded size to avoid buffer reallocations.
+/// Appends a `BatchCommit` marker as the final record so that crash
+/// recovery can distinguish a fully-written batch from a truncated one.
 /// Returns the buffer and the total estimated memory footprint.
 pub(crate) fn encode_batch(records: &[InternalRecord]) -> (Vec<u8>, u64) {
-    let total_size: usize = records.iter().map(encoded_size).sum();
+    let marker_size = encoded_size(&batch_commit_marker(
+        records.last().map(|r| r.seq).unwrap_or(0),
+        records.len() as u64,
+    ));
+    let total_size: usize = records.iter().map(encoded_size).sum::<usize>() + marker_size;
     let mut buf = Vec::with_capacity(total_size);
     let mut total_mem_bytes: u64 = 0;
     for rec in records {
         encode_record(rec, &mut buf);
         total_mem_bytes += rec.estimated_size() as u64;
     }
+    // Append the batch-commit marker as the very last record so that
+    // recovery can detect whether the batch was fully written.
+    let marker = batch_commit_marker(
+        records.last().map(|r| r.seq).unwrap_or(0),
+        records.len() as u64,
+    );
+    encode_record(&marker, &mut buf);
     (buf, total_mem_bytes)
+}
+
+/// Build a WAL-only `BatchCommit` marker record.
+fn batch_commit_marker(batch_max_seq: u64, record_count: u64) -> InternalRecord {
+    InternalRecord {
+        seq: batch_max_seq,
+        op: Op::BatchCommit,
+        key: Vec::new(),
+        ts: record_count as i64,
+        expire_at: i64::MAX,
+        value: Vec::new(),
+        range_end: None,
+    }
 }
 
 /// Returns the exact encoded byte size of a single `InternalRecord`,
@@ -425,8 +474,7 @@ fn decode_record(data: &[u8]) -> Result<Option<(InternalRecord, usize)>> {
         return Err(crate::error::FlowError::Corruption {
             file: "WAL".into(),
             msg: "Checksum mismatch in WAL record".into(),
-        }
-        .into());
+        });
     }
     pos += CHECKSUM_LEN;
 
@@ -617,7 +665,10 @@ mod tests {
         let result = wal.replay_from(0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].key, b"k1");
-        assert_eq!(len, 8 + 1 + 2 + 2 + 8 + 8 + 4 + 4 + 3 + CHECKSUM_LEN);
+        // Buffer = record + BatchCommit marker.
+        let rec_size = 8 + 1 + 2 + 2 + 8 + 8 + 4 + 4 + 3 + CHECKSUM_LEN;
+        let marker_size = 8 + 1 + 2 + 8 + 8 + 4 + 4 + CHECKSUM_LEN;
+        assert_eq!(len, rec_size + marker_size);
     }
 
     #[test]
@@ -891,6 +942,142 @@ mod tests {
         let different_data = b"hello world!";
         let cs3 = compute_checksum(different_data);
         assert_ne!(cs1, cs3, "different data must have different checksums");
+    }
+
+    // ── Batch commit marker tests (cross-crash atomicity) ───────────
+
+    #[test]
+    fn test_batch_commit_marker_replay_complete() {
+        // A fully-written batch (with marker) should replay all records.
+        let dir = TempDir::new().unwrap();
+        let mut wal = Wal::open(dir.path(), 64).unwrap();
+
+        let recs = vec![
+            make_record("a", 1, 1),
+            make_record("b", 2, 2),
+            make_record("c", 3, 3),
+        ];
+        let (buf, _) = encode_batch(&recs);
+        wal.write_encoded(&buf, 3).unwrap();
+
+        let result = wal.replay_from(0).unwrap();
+        assert_eq!(result.len(), 3, "all records should be committed");
+        assert_eq!(result[0].key, b"a");
+        assert_eq!(result[2].key, b"c");
+    }
+
+    #[test]
+    fn test_batch_commit_marker_truncated_discards_pending() {
+        // Simulate a crash that truncates the WAL after the data records
+        // but BEFORE the batch commit marker.  Recovery should discard
+        // the uncommitted records.
+        let dir = TempDir::new().unwrap();
+
+        {
+            let mut wal = Wal::open(dir.path(), 64).unwrap();
+            // Batch 1: fully committed (has marker).
+            let batch1 = vec![make_record("committed", 1, 1)];
+            let (buf1, _) = encode_batch(&batch1);
+            wal.write_encoded(&buf1, 1).unwrap();
+
+            // Batch 2: data records without marker (simulate truncation).
+            // We write ONLY the data records, no marker.
+            let rec2 = make_record("uncommitted", 2, 2);
+            let mut buf2 = Vec::new();
+            encode_record(&rec2, &mut buf2); // encode_record, NOT encode_batch
+            wal.write_encoded(&buf2, 2).unwrap();
+        }
+
+        // Re-open and replay. The first batch has a marker → committed.
+        // The second batch has NO marker → should be discarded.
+        let mut wal2 = Wal::open(dir.path(), 64).unwrap();
+        let result = wal2.replay_from(0).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "uncommitted batch should be discarded, got {:?}",
+            result.iter().map(|r| String::from_utf8_lossy(&r.key)).collect::<Vec<_>>()
+        );
+        assert_eq!(result[0].key, b"committed");
+    }
+
+    #[test]
+    fn test_batch_commit_marker_backward_compat_no_markers() {
+        // Old WAL files without any markers should replay all records
+        // (backward-compatible behavior).
+        let dir = TempDir::new().unwrap();
+
+        {
+            let mut wal = Wal::open(dir.path(), 64).unwrap();
+            // Write raw records without markers (simulating old format).
+            for i in 0..5u8 {
+                let rec = make_record(&format!("old{}", i), i as i64, i as u64 + 1);
+                let mut buf = Vec::new();
+                encode_record(&rec, &mut buf);
+                wal.write_encoded(&buf, i as u64 + 1).unwrap();
+            }
+        }
+
+        let mut wal2 = Wal::open(dir.path(), 64).unwrap();
+        let result = wal2.replay_from(0).unwrap();
+        assert_eq!(result.len(), 5, "old-format records should all be committed");
+    }
+
+    #[test]
+    fn test_batch_commit_marker_multiple_batches() {
+        // Multiple complete batches should all be committed.
+        let dir = TempDir::new().unwrap();
+        let mut wal = Wal::open(dir.path(), 64).unwrap();
+
+        for batch_num in 0..3u8 {
+            let recs = vec![
+                make_record(&format!("k{}a", batch_num), batch_num as i64 * 10, batch_num as u64 * 2 + 1),
+                make_record(&format!("k{}b", batch_num), batch_num as i64 * 10 + 1, batch_num as u64 * 2 + 2),
+            ];
+            let (buf, _) = encode_batch(&recs);
+            wal.write_encoded(&buf, batch_num as u64 * 2 + 2).unwrap();
+        }
+
+        let result = wal.replay_from(0).unwrap();
+        assert_eq!(result.len(), 6, "all 3 batches × 2 records should be committed");
+    }
+
+    #[test]
+    fn test_batch_commit_marker_partial_last_batch() {
+        // Complete batch followed by a partial batch (no marker).
+        // Only the complete batch should be replayed.
+        let dir = TempDir::new().unwrap();
+
+        {
+            let mut wal = Wal::open(dir.path(), 64).unwrap();
+
+            // Batch 1: complete (with marker).
+            let batch1 = vec![make_record("keep1", 1, 1), make_record("keep2", 2, 2)];
+            let (buf1, _) = encode_batch(&batch1);
+            wal.write_encoded(&buf1, 2).unwrap();
+
+            // Batch 2: partial — write only data records, no marker.
+            let partial_recs = vec![
+                make_record("drop1", 3, 3),
+                make_record("drop2", 4, 4),
+            ];
+            let mut buf2 = Vec::new();
+            for rec in &partial_recs {
+                encode_record(rec, &mut buf2);
+            }
+            wal.write_encoded(&buf2, 4).unwrap();
+        }
+
+        let mut wal2 = Wal::open(dir.path(), 64).unwrap();
+        let result = wal2.replay_from(0).unwrap();
+        let keys: Vec<String> = result.iter()
+            .map(|r| String::from_utf8_lossy(&r.key).into_owned())
+            .collect();
+        assert!(
+            keys.iter().all(|k| k.starts_with("keep")),
+            "partial batch should be discarded, got {:?}", keys
+        );
+        assert_eq!(result.len(), 2);
     }
 
 }

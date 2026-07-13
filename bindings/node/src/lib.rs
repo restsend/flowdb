@@ -115,8 +115,10 @@ pub struct FlowDb {
 impl FlowDb {
     #[napi]
     pub fn open(config: JsConfig) -> Result<FlowDb> {
-        let mut cfg = Config::default();
-        cfg.data_dir = config.data_dir.into();
+        let mut cfg = Config {
+            data_dir: config.data_dir.into(),
+            ..Default::default()
+        };
         if let Some(v) = config.create_if_missing {
             cfg.create_if_missing = v;
         }
@@ -1090,12 +1092,15 @@ impl FlowDb {
             mode: tx_mode,
             stores,
             ops: std::sync::Mutex::new(Vec::new()),
+            snapshot_seq: self.inner.last_seq(),
+            reads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 }
 
 // ── JsTransaction ───────────────────────────────────────────────────
 
+#[derive(Clone)]
 enum TxOp {
     Put { store: String, value: Value },
     PutAuto { store: String, value: Value },
@@ -1108,6 +1113,80 @@ pub struct JsTransaction {
     mode: TransactionMode,
     stores: Vec<String>,
     ops: std::sync::Mutex<Vec<TxOp>>,
+    /// MVCC snapshot captured at transaction creation.
+    snapshot_seq: u64,
+    /// OCC read-set: (store, key_bytes, value_bytes) tracked for
+    /// conflict detection at commit time.  Shared with async read tasks
+    /// via Arc so reads are visible at commit.
+    reads: std::sync::Arc<std::sync::Mutex<Vec<ReadEntry>>>,
+}
+
+struct ReadEntry {
+    store: String,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+}
+
+/// Async task for MVCC snapshot-aware point reads within a transaction.
+/// Checks the buffered write-ops first (read-your-writes), then falls
+/// back to a snapshot-isolated engine read.
+pub struct TxGetTask {
+    db: Arc<JsonDB>,
+    store: String,
+    key: Value,
+    snapshot_seq: u64,
+    reads: std::sync::Arc<std::sync::Mutex<Vec<ReadEntry>>>,
+    ops_snapshot: Vec<TxOp>,
+}
+
+impl Task for TxGetTask {
+    type Output = Option<Value>;
+    type JsValue = napi::JsUnknown;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        // Read-your-writes: check buffered ops for a matching put/delete.
+        let key_path = self
+            .db
+            .get_store(&self.store)
+            .map(|s| s.key_path)
+            .unwrap_or_default();
+        for op in &self.ops_snapshot {
+            match op {
+                TxOp::Put { store, value } | TxOp::PutAuto { store, value }
+                    if store == &self.store =>
+                {
+                    if value.get(&key_path) == Some(&self.key) {
+                        return Ok(Some(value.clone()));
+                    }
+                }
+                TxOp::Delete { store, key } if store == &self.store && key == &self.key => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+
+        // Fall back to MVCC snapshot read.
+        let result = self
+            .db
+            .get_snapshot(&self.store, &self.key, self.snapshot_seq)
+            .map_err(flow_err)?;
+        // Track in OCC read-set.
+        let key_bytes = serde_json::to_vec(&self.key).unwrap_or_default();
+        let val_bytes = result.as_ref().map(|v| serde_json::to_vec(v).unwrap_or_default());
+        if let Ok(mut guard) = self.reads.lock() {
+            guard.push(ReadEntry {
+                store: self.store.clone(),
+                key: key_bytes,
+                value: val_bytes,
+            });
+        }
+        Ok(result)
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        value_opt_to_js(&env, output)
+    }
 }
 
 #[napi]
@@ -1140,11 +1219,18 @@ impl JsTransaction {
     }
 
     #[napi]
-    pub fn get(&self, store: String, key: Value) -> AsyncTask<GetTask> {
-        AsyncTask::new(GetTask {
-            inner: self.db.clone(),
+    pub fn get(&self, store: String, key: Value) -> AsyncTask<TxGetTask> {
+        let ops_snapshot = {
+            let guard = self.ops.lock().expect("transaction lock poisoned");
+            guard.clone()
+        };
+        AsyncTask::new(TxGetTask {
+            db: self.db.clone(),
             store,
             key,
+            snapshot_seq: self.snapshot_seq,
+            reads: self.reads.clone(),
+            ops_snapshot,
         })
     }
 
@@ -1202,11 +1288,17 @@ impl JsTransaction {
             let mut guard = self.ops.lock().expect("transaction lock poisoned");
             std::mem::take(&mut *guard)
         };
+        let reads = {
+            let mut guard = self.reads.lock().expect("transaction reads lock poisoned");
+            std::mem::take(&mut *guard)
+        };
         AsyncTask::new(CommitTask {
             db: self.db.clone(),
             mode: self.mode,
             stores: self.stores.clone(),
             ops,
+            snapshot_seq: self.snapshot_seq,
+            reads,
         })
     }
 
@@ -1228,6 +1320,8 @@ pub struct CommitTask {
     mode: TransactionMode,
     stores: Vec<String>,
     ops: Vec<TxOp>,
+    snapshot_seq: u64,
+    reads: Vec<ReadEntry>,
 }
 
 impl Task for CommitTask {
@@ -1240,6 +1334,14 @@ impl Task for CommitTask {
             .db
             .transaction(&store_refs, self.mode)
             .map_err(flow_err)?;
+
+        // Override snapshot with the one captured at JsTransaction creation.
+        tx.set_snapshot_seq(self.snapshot_seq);
+
+        // Inject OCC read-set entries collected during the transaction.
+        for entry in &self.reads {
+            tx.add_read_entry(&entry.store, entry.key.clone(), entry.value.clone());
+        }
 
         let ops = std::mem::take(&mut self.ops);
         for op in ops {

@@ -416,10 +416,10 @@ impl SstStreamWriter {
 
 impl Drop for SstStreamWriter {
     fn drop(&mut self) {
-        if !self.finished && !self.current_block.is_empty() {
-            if let Err(e) = self.flush_block() {
-                tracing::error!("SstStreamWriter::drop: flush_block failed: {}", e);
-            }
+        if !self.finished && !self.current_block.is_empty()
+            && let Err(e) = self.flush_block()
+        {
+            tracing::error!("SstStreamWriter::drop: flush_block failed: {}", e);
         }
     }
 }

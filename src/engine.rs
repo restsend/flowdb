@@ -86,6 +86,11 @@ pub struct Engine {
     config: Config,
     worker: Arc<WritePipeline>,
     seq_counter: std::sync::atomic::AtomicU64,
+    /// Monotonically increasing seq of the last *committed* write.
+    /// Updated only after `WritePipeline::submit` returns Ok, so any
+    /// reader that loads this value is guaranteed to see all writes
+    /// with seq ≤ committed_seq in the memtable / SSTs.
+    committed_seq: std::sync::atomic::AtomicU64,
     stats: Arc<StatsCounters>,
     memtables: Arc<MemTables>,
     index: Arc<RwLock<BlockMetaIndex>>,
@@ -384,6 +389,7 @@ impl Engine {
             .copied()
             .unwrap_or(0);
         let seq_counter = std::sync::atomic::AtomicU64::new((max_sst_id as u64 + 1) * 1_000_000);
+        let committed_seq = std::sync::atomic::AtomicU64::new(0);
 
         let auto_bg = config.auto_background;
 
@@ -401,6 +407,7 @@ impl Engine {
             config,
             worker,
             seq_counter,
+            committed_seq,
             stats,
             memtables,
             index,
@@ -436,11 +443,13 @@ impl Engine {
         self.write_batch_owned_ttl(batch, None)
     }
 
-    /// Write a batch synchronously, bypassing the background write pipeline.
+    /// Write a batch of records synchronously.
     ///
-    /// This method encodes, WAL-logs, and memtable-inserts on the calling thread.
-    /// It is useful when the caller needs a synchronous durability guarantee
-    /// without waiting for the background writer.
+    /// This method encodes the batch and submits it through the write
+    /// pipeline, which WAL-logs and memtable-inserts under a single
+    /// group-commit.  It is functionally equivalent to `write_batch_owned`
+    /// — all public write methods are equally synchronous and durable
+    /// (governed by [`Config::wal_sync_mode`]).
     pub fn write_batch_sync(&self, batch: Vec<Record>) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -531,9 +540,30 @@ impl Engine {
         };
         self.worker.submit(sub)?;
 
+        // Advance committed_seq so snapshot readers can see this batch.
+        // fetch_max guarantees monotonicity even under concurrent writers
+        // (group-commit may interleave the store calls).
+        self.committed_seq
+            .fetch_max(batch_max_seq, std::sync::atomic::Ordering::Release);
+
         self.stats
             .record_write_latency(start.elapsed().as_micros() as u64);
         Ok(())
+    }
+
+    /// Returns the sequence number of the last committed write.
+    /// All records with `seq <=` this value are guaranteed to be visible
+    /// in the memtable or SSTables.  Used by [`Transaction`](crate::jsondb::Transaction)
+    /// to establish a snapshot for MVCC isolation.
+    pub fn last_seq(&self) -> u64 {
+        self.committed_seq
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Internal accessor for the memtables (used by tests).
+    #[cfg(test)]
+    pub(crate) fn memtables_ref(&self) -> &MemTables {
+        &self.memtables
     }
 
     pub fn query(&self, query: Query) -> Result<Vec<Record>> {
@@ -548,6 +578,7 @@ impl Engine {
             &self.storage,
             &self.readers,
             now_us,
+            u64::MAX,
         )?;
         let records: Vec<Record> = iter.collect::<Result<Vec<_>>>()?;
 
@@ -676,6 +707,86 @@ impl Engine {
                 expire_at: rec.expire_at,
                 value: rec.value.clone(),
             });
+        }
+        None
+    }
+
+    /// MVCC variant of `block_search`: filters by `seq <= max_seq`.
+    fn block_search_seq(
+        &self,
+        key: &[u8],
+        ts: i64,
+        now_us: i64,
+        sst_id: u32,
+        block_idx: u32,
+        max_seq: u64,
+    ) -> Option<Record> {
+        let reader = match Engine::get_reader(&self.readers, &self.storage, sst_id) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    "SST MVCC lookup: cannot open reader for sst {}: {}",
+                    sst_id,
+                    e
+                );
+                return None;
+            }
+        };
+
+        if let Some(cached) = reader.read_block_cached(block_idx, &self.cache) {
+            return Self::find_in_records_seq(&cached, key, ts, now_us, max_seq);
+        }
+
+        match reader.read_block_decompress(block_idx) {
+            Ok((_header, records)) => {
+                let result = Self::find_in_records_seq(&records, key, ts, now_us, max_seq);
+                self.cache.insert(CacheKey { sst_id, block_idx }, records);
+                result
+            }
+            Err(e) => {
+                tracing::error!(
+                    "SST MVCC lookup: block decompress failed sst={} block={}: {}",
+                    sst_id,
+                    block_idx,
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// MVCC variant of `find_in_records`: finds the highest-seq record
+    /// for (key, ts) with seq ≤ max_seq.  Records in an SST block are
+    /// sorted by (key, ts, seq desc), so the first match has the highest
+    /// seq — we scan forward until we find one ≤ max_seq.
+    fn find_in_records_seq(
+        records: &[InternalRecord],
+        key: &[u8],
+        ts: i64,
+        now_us: i64,
+        max_seq: u64,
+    ) -> Option<Record> {
+        let lo = match records
+            .binary_search_by(|r| r.key.as_slice().cmp(key).then_with(|| r.ts.cmp(&ts)))
+        {
+            Ok(idx) => idx,
+            Err(_) => return None,
+        };
+        for rec in &records[lo..] {
+            if rec.key.as_slice() != key || rec.ts != ts {
+                break;
+            }
+            if rec.seq <= max_seq {
+                if rec.expire_at > now_us && rec.op != Op::Delete {
+                    return Some(Record {
+                        key: key.to_vec(),
+                        ts: rec.ts,
+                        expire_at: rec.expire_at,
+                        value: rec.value.clone(),
+                    });
+                }
+                return None;
+            }
         }
         None
     }
@@ -911,7 +1022,7 @@ impl Engine {
 
         let mut w = self.worker.worker.lock();
         w.do_flush()?;
-        w.flush_wal()
+        w.sync_wal()
     }
 
     /// Remove reader cache entries for SSTs that are no longer in the
@@ -943,6 +1054,28 @@ impl Engine {
             &self.storage,
             &self.readers,
             now_us,
+            u64::MAX,
+        )
+    }
+
+    /// MVCC scan: like `scan` but only returns records with `seq <= max_seq`.
+    /// Used by [`Transaction`](crate::jsondb::Transaction) for snapshot isolation.
+    pub(crate) fn scan_seq(&self, range: ScanRange, max_seq: u64) -> Result<ScanIterator> {
+        let now_us = now_micros();
+        let (key_filter, time_range) = range.to_query_params();
+        let q = Query {
+            key_filter,
+            time_range,
+        };
+        ScanIterator::build(
+            &q,
+            &self.memtables,
+            &self.index,
+            &self.cache,
+            &self.storage,
+            &self.readers,
+            now_us,
+            max_seq,
         )
     }
 
@@ -1081,6 +1214,32 @@ impl Engine {
         found
     }
 
+    /// MVCC point read: like `get_bytes` but only returns records with
+    /// `seq <= max_seq`.  Used by [`Transaction`](crate::jsondb::Transaction)
+    /// for snapshot isolation.
+    pub(crate) fn get_bytes_seq(&self, key: &[u8], ts: i64, max_seq: u64) -> Option<Record> {
+        let now_us = now_micros();
+
+        if let Some(rec) = self.memtables.get_seq(key, ts, now_us, max_seq) {
+            if rec.op != Op::Delete {
+                return Some(rec.to_record());
+            }
+            return None;
+        }
+
+        let idx = self.index.read();
+        if let Some((sst_id, block_idx)) = idx.single_sst_point(key, now_us) {
+            drop(idx);
+            return self.block_search_seq(key, ts, now_us, sst_id, block_idx, max_seq);
+        }
+
+        let found = idx.query_point_inline(key, now_us, |meta| {
+            self.block_search_seq(key, ts, now_us, meta.sst_id, meta.block_idx, max_seq)
+        });
+        drop(idx);
+        found
+    }
+
     /// Write a batch of [`InternalRecord`]s (puts, deletes, range-deletes)
     /// atomically. Sequence numbers are assigned automatically. This is the
     /// primitive used by the `jsondb` module for atomic multi-key updates
@@ -1159,9 +1318,10 @@ impl ScanIterator {
         storage: &Arc<dyn StorageBackend>,
         readers: &Arc<RwLock<HashMap<u32, Arc<SstReader>>>>,
         now_us: i64,
+        max_seq: u64,
     ) -> Result<Self> {
         // 1) Query memtables (eager — memtable is small)
-        let mem_results = match (&query.key_filter, &query.time_range) {
+        let mut mem_results = match (&query.key_filter, &query.time_range) {
             (KeyFilter::Prefix(key), None) => memtables.query_prefix(key, now_us),
             (KeyFilter::Range { start, end }, None) => {
                 memtables.query_key_range(start, end, now_us)
@@ -1177,6 +1337,11 @@ impl ScanIterator {
             }
             (KeyFilter::All, None) => memtables.query_key_range(b"", b"~", now_us),
         };
+
+        // MVCC: drop memtable records written after the snapshot.
+        if max_seq != u64::MAX {
+            mem_results.retain(|r| r.seq <= max_seq);
+        }
 
         // 2) Collect memtable range tombstones
         let mut tombstones: Vec<(Vec<u8>, Vec<u8>)> = mem_results
@@ -1236,6 +1401,9 @@ impl ScanIterator {
                 };
                 let mut filtered: Vec<InternalRecord> = Vec::with_capacity(records.len());
                 for rec in records {
+                    if max_seq != u64::MAX && rec.seq > max_seq {
+                        continue;
+                    }
                     if rec.expire_at <= now_us {
                         continue;
                     }
@@ -1287,6 +1455,7 @@ impl ScanIterator {
                     false,
                     now_us,
                     &mut tombstones,
+                    max_seq,
                 );
                 if !filtered.is_empty() {
                     sst_sources.push(filtered.into_iter().peekable());
@@ -1381,9 +1550,13 @@ fn filter_sst_block(
     is_full_scan: bool,
     now_us: i64,
     tombstones: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    max_seq: u64,
 ) -> Vec<InternalRecord> {
     let mut filtered = Vec::with_capacity(records.len().min(64));
     for rec in records {
+        if max_seq != u64::MAX && rec.seq > max_seq {
+            continue;
+        }
         if rec.expire_at <= now_us {
             continue;
         }

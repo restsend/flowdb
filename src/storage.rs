@@ -172,6 +172,7 @@ impl SingleFileStorage {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(db_path)?;
 
         let write_pos;
@@ -642,7 +643,7 @@ mod tests {
     fn test_open_storage_creates_multi_file() {
         let dir = TempDir::new().unwrap();
         let storage = open_storage(dir.path(), false).unwrap();
-        assert!(storage.sst_exists(0) == false);
+        assert!(!storage.sst_exists(0));
     }
 
     // ── SingleFileStorage tests ─────────────────────────────────
