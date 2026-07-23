@@ -56,6 +56,7 @@ impl SupaBase {
     fn open(path: &std::path::Path) -> Self {
         let db = JsonDB::open(Config {
             data_dir: path.to_path_buf(),
+            compression: flowdb::record::CompressionAlgorithm::Lz4,
             ..Config::default()
         })
         .unwrap();

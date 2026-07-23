@@ -2,7 +2,7 @@ use crate::block_meta_index::BlockMetaIndex;
 use crate::cache::BlockCache;
 use crate::error::Result;
 use crate::manifest::{Manifest, ManifestEntry, SstInfo};
-use crate::record::{InternalRecord, Op};
+use crate::record::{CompressionAlgorithm, InternalRecord, Op};
 use crate::sstable::{SstReader, SstStreamWriter};
 use crate::stats::StatsCounters;
 use crate::storage::StorageBackend;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub(crate) struct CompactionRunner {
     block_size: usize,
     bloom_bits_per_key: usize,
+    compression: CompressionAlgorithm,
     compaction_threshold: usize,
     manifest: Arc<parking_lot::Mutex<Manifest>>,
     index: Arc<parking_lot::RwLock<BlockMetaIndex>>,
@@ -24,6 +25,7 @@ impl CompactionRunner {
     pub fn new(
         block_size: usize,
         bloom_bits_per_key: usize,
+        compression: CompressionAlgorithm,
         compaction_threshold: usize,
         manifest: Arc<parking_lot::Mutex<Manifest>>,
         index: Arc<parking_lot::RwLock<BlockMetaIndex>>,
@@ -34,6 +36,7 @@ impl CompactionRunner {
         Self {
             block_size,
             bloom_bits_per_key,
+            compression,
             compaction_threshold,
             manifest,
             index,
@@ -125,6 +128,7 @@ impl CompactionRunner {
             self.block_size,
             estimated_records,
             self.bloom_bits_per_key,
+            self.compression,
         )?;
 
         let mut last_dedup: Option<(Vec<u8>, i64)> = None;
@@ -353,6 +357,7 @@ mod tests {
         CompactionRunner::new(
             100,
             10,
+            CompressionAlgorithm::Lz4,
             threshold,
             Arc::new(parking_lot::Mutex::new(Manifest::open(dir).unwrap())),
             Arc::new(RwLock::new(BlockMetaIndex::new(3600))),

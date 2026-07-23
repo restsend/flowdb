@@ -1,6 +1,6 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-use flowdb::{Config, Engine, Query, Record, SyncMode};
+use flowdb::{CompressionAlgorithm, Config, Engine, Query, Record, SyncMode};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +40,7 @@ fn stress_config(dir: &Path) -> Config {
         wal_sync_mode: SyncMode::Always,
         auto_background: false,
         storage_backend: flowdb::StorageBackendKind::MultiFile,
+        compression: CompressionAlgorithm::Lz4,
     }
 }
 

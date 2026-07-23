@@ -6,6 +6,8 @@ export interface OpenConfig {
   blockCacheCapacityMb?: number
   bloomBitsPerKey?: number
   compactionIntervalMs?: number
+  /** Compression algorithm: "none" | "lz4" | "zstd:<level>" (e.g. "zstd:3") */
+  compression?: string
 }
 
 export interface KeyRange {

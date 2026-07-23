@@ -46,6 +46,7 @@ fn main() {
     let dir = tempfile::TempDir::with_prefix("flowdb_jsondb_").unwrap();
     let db = JsonDB::open(Config {
         data_dir: dir.path().to_path_buf(),
+        compression: flowdb::record::CompressionAlgorithm::Lz4,
         ..Config::default()
     })
     .unwrap();

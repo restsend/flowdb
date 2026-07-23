@@ -2,12 +2,14 @@ use crate::bloom::BloomFilter;
 use crate::cache::{BlockCache, CacheKey};
 use crate::error::{FlowError, Result};
 use crate::manifest::BlockInfo;
-use crate::record::{InternalRecord, Op};
+use crate::record::{CompressionAlgorithm, InternalRecord, Op};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-const BLOCK_MAGIC_LZ4: u32 = 0x54534E42;
+const BLOCK_MAGIC_NONE: u32 = 0x4E4F4E45; // "NONE"
+const BLOCK_MAGIC_LZ4: u32 = 0x54534E42;  // "BSN" (backward compatible)
+const BLOCK_MAGIC_ZSTD: u32 = 0x5A535444; // "ZSTD"
 pub(crate) const HEADER_SIZE: usize = 48;
 
 pub(crate) struct SstBlock {
@@ -16,6 +18,7 @@ pub(crate) struct SstBlock {
 
 #[derive(Debug, Clone)]
 pub(crate) struct BlockHeader {
+    pub compression: CompressionAlgorithm,
     pub num_records: u32,
     pub min_ts: i64,
     pub max_ts: i64,
@@ -30,7 +33,11 @@ impl BlockHeader {
     /// Layout: magic(4) | num_records(4) | min_ts(8) | max_ts(8) |
     ///         min_expire(8) | max_expire(8) | data_len(4) | compressed_len(4)
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
-        let magic = BLOCK_MAGIC_LZ4;
+        let magic = match self.compression {
+            CompressionAlgorithm::None => BLOCK_MAGIC_NONE,
+            CompressionAlgorithm::Lz4 => BLOCK_MAGIC_LZ4,
+            CompressionAlgorithm::Zstd { .. } => BLOCK_MAGIC_ZSTD,
+        };
         let mut buf = [0u8; HEADER_SIZE];
         let mut pos = 0;
         buf[pos..pos + 4].copy_from_slice(&magic.to_be_bytes());
@@ -62,13 +69,19 @@ impl BlockHeader {
             });
         }
         let magic = u32::from_be_bytes(data[..4].try_into().unwrap());
-        if magic != BLOCK_MAGIC_LZ4 {
-            return Err(FlowError::InvalidMagic {
-                expected: BLOCK_MAGIC_LZ4,
-                actual: magic,
-            });
-        }
+        let compression = match magic {
+            BLOCK_MAGIC_NONE => CompressionAlgorithm::None,
+            BLOCK_MAGIC_LZ4 => CompressionAlgorithm::Lz4,
+            BLOCK_MAGIC_ZSTD => CompressionAlgorithm::Zstd { level: 0 },
+            _ => {
+                return Err(FlowError::InvalidMagic {
+                    expected: BLOCK_MAGIC_LZ4,
+                    actual: magic,
+                });
+            }
+        };
         Ok(Self {
+            compression,
             num_records: u32::from_be_bytes(data[4..8].try_into().unwrap()),
             min_ts: i64::from_be_bytes(data[8..16].try_into().unwrap()),
             max_ts: i64::from_be_bytes(data[16..24].try_into().unwrap()),
@@ -81,8 +94,30 @@ impl BlockHeader {
 }
 
 fn decompress_block(data: &[u8], header: &BlockHeader) -> Result<Vec<u8>> {
-    lz4_flex::block::decompress(data, header.data_len as usize)
-        .map_err(|e| FlowError::Other(format!("lz4 decompress: {}", e)))
+    match header.compression {
+        CompressionAlgorithm::None => Ok(data.to_vec()),
+        CompressionAlgorithm::Lz4 => lz4_flex::block::decompress(data, header.data_len as usize)
+            .map_err(|e| FlowError::Other(format!("lz4 decompress: {}", e))),
+        CompressionAlgorithm::Zstd { .. } => {
+            let mut out = Vec::with_capacity(header.data_len as usize);
+            zstd::stream::copy_decode(data, &mut out)
+                .map_err(|e| FlowError::Other(format!("zstd decompress: {}", e)))?;
+            Ok(out)
+        }
+    }
+}
+
+fn compress_block(data: &[u8], compression: CompressionAlgorithm) -> Result<Vec<u8>> {
+    match compression {
+        CompressionAlgorithm::None => Ok(data.to_vec()),
+        CompressionAlgorithm::Lz4 => Ok(lz4_flex::block::compress(data)),
+        CompressionAlgorithm::Zstd { level } => {
+            let mut out = Vec::new();
+            zstd::stream::copy_encode(data, &mut out, level)
+                .map_err(|e| FlowError::Other(format!("zstd compress: {}", e)))?;
+            Ok(out)
+        }
+    }
 }
 
 /// Encodes records into a compact binary buffer (big-endian, no compression).
@@ -192,6 +227,7 @@ impl SstWriter {
         records: &[InternalRecord],
         block_size: usize,
         bloom_bits_per_key: usize,
+        compression: CompressionAlgorithm,
     ) -> Result<(Vec<u8>, u64, Vec<BlockInfo>, BloomFilter)> {
         let mut buf = Vec::with_capacity(records.len() * 64);
         let mut block_infos = Vec::new();
@@ -210,7 +246,7 @@ impl SstWriter {
         for chunk in records.chunks(block_size.max(1)) {
             let raw_data = encode_records(chunk);
             let data_len = raw_data.len() as u32;
-            let compressed = lz4_flex::block::compress(&raw_data);
+            let compressed = compress_block(&raw_data, compression)?;
             let compressed_len = compressed.len() as u32;
 
             let min_ts = chunk.iter().map(|r| r.ts).min().unwrap_or(0);
@@ -232,6 +268,7 @@ impl SstWriter {
                 .unwrap_or_default();
 
             let header = BlockHeader {
+                compression,
                 num_records: chunk.len() as u32,
                 min_ts,
                 max_ts,
@@ -270,9 +307,10 @@ impl SstWriter {
         records: &[InternalRecord],
         block_size: usize,
         bloom_bits_per_key: usize,
+        compression: CompressionAlgorithm,
     ) -> Result<(u64, Vec<BlockInfo>, BloomFilter)> {
         let (data, total_bytes, block_infos, bloom) =
-            Self::write_to_buf(records, block_size, bloom_bits_per_key)?;
+            Self::write_to_buf(records, block_size, bloom_bits_per_key, compression)?;
         let mut file = std::fs::File::create(path)?;
         file.write_all(&data)?;
         file.flush()?;
@@ -292,6 +330,7 @@ impl SstWriter {
 pub(crate) struct SstStreamWriter {
     buf: Vec<u8>,
     block_size: usize,
+    compression: CompressionAlgorithm,
     bloom: BloomFilter,
     current_block: Vec<InternalRecord>,
     block_infos: Vec<BlockInfo>,
@@ -304,11 +343,13 @@ impl SstStreamWriter {
         block_size: usize,
         estimated_keys: usize,
         bloom_bits_per_key: usize,
+        compression: CompressionAlgorithm,
     ) -> Result<Self> {
         let bloom = BloomFilter::with_bits_per_key(estimated_keys.max(1), bloom_bits_per_key);
         Ok(Self {
             buf: Vec::new(),
             block_size,
+            compression,
             bloom,
             current_block: Vec::with_capacity(block_size),
             block_infos: Vec::new(),
@@ -351,7 +392,7 @@ impl SstStreamWriter {
 
         let raw_data = encode_records(&self.current_block);
         let data_len = raw_data.len() as u32;
-        let compressed = lz4_flex::block::compress(&raw_data);
+        let compressed = compress_block(&raw_data, self.compression)?;
         let compressed_len = compressed.len() as u32;
 
         let min_ts = self.current_block.iter().map(|r| r.ts).min().unwrap_or(0);
@@ -385,6 +426,7 @@ impl SstStreamWriter {
             .unwrap_or_default();
 
         let header = BlockHeader {
+            compression: self.compression,
             num_records: self.current_block.len() as u32,
             min_ts,
             max_ts,
@@ -669,7 +711,8 @@ mod tests {
         let path = dir.path().join("test.sst");
         let records = make_records(100);
 
-        let (bytes, block_infos, _) = SstWriter::write(&path, &records, 10, 10).unwrap();
+        let (bytes, block_infos, _) =
+            SstWriter::write(&path, &records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
         assert!(bytes > 0);
         assert_eq!(block_infos.len(), 10);
 
@@ -687,7 +730,8 @@ mod tests {
         let path = dir.path().join("test.sst");
         let records = make_records(50);
 
-        let (_, block_infos, _) = SstWriter::write(&path, &records, 10, 10).unwrap();
+        let (_, block_infos, _) =
+            SstWriter::write(&path, &records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
         let reader = SstReader::open(&path, 1, block_infos.len()).unwrap();
 
         let mut all_records = Vec::new();
@@ -708,7 +752,8 @@ mod tests {
         let path = dir.path().join("test.sst");
         let records = make_records(20);
 
-        let (_, block_infos, _) = SstWriter::write(&path, &records, 10, 10).unwrap();
+        let (_, block_infos, _) =
+            SstWriter::write(&path, &records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
         assert_eq!(block_infos.len(), 2);
 
         assert_eq!(block_infos[0].min_key, b"key_0000");
@@ -738,7 +783,8 @@ mod tests {
             .collect();
 
         let path = dir.path().join("compressed.sst");
-        let (bytes, _, _) = SstWriter::write(&path, &records, 100, 10).unwrap();
+        let (bytes, _, _) =
+            SstWriter::write(&path, &records, 100, 10, CompressionAlgorithm::Lz4).unwrap();
 
         let raw_size: usize = records.iter().map(|r| r.estimated_size()).sum();
         assert!(bytes < raw_size as u64);
@@ -746,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_sst_stream_writer_empty() {
-        let writer = SstStreamWriter::new(10, 0, 10).unwrap();
+        let writer = SstStreamWriter::new(10, 0, 10, CompressionAlgorithm::Lz4).unwrap();
         let (data, bytes, blocks, _bloom) = writer.finish().unwrap();
         assert!(data.is_empty(), "empty writer produces zero bytes");
         assert_eq!(bytes, 0, "empty writer produces zero bytes");
@@ -758,7 +804,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("single.sst");
         let records = make_records(5);
-        let mut writer = SstStreamWriter::new(100, 5, 10).unwrap();
+        let mut writer = SstStreamWriter::new(100, 5, 10, CompressionAlgorithm::Lz4).unwrap();
         for rec in &records {
             writer.write_record(rec).unwrap();
         }
@@ -790,7 +836,7 @@ mod tests {
         let path = dir.path().join("multi.sst");
         let records = make_records(25);
         // block_size = 10 → 3 blocks (10 + 10 + 5)
-        let mut writer = SstStreamWriter::new(10, 25, 10).unwrap();
+        let mut writer = SstStreamWriter::new(10, 25, 10, CompressionAlgorithm::Lz4).unwrap();
         for rec in &records {
             writer.write_record(rec).unwrap();
         }
@@ -826,14 +872,15 @@ mod tests {
 
         let records = make_records(50);
         // Stream write
-        let mut sw = SstStreamWriter::new(10, 50, 10).unwrap();
+        let mut sw = SstStreamWriter::new(10, 50, 10, CompressionAlgorithm::Lz4).unwrap();
         for rec in &records {
             sw.write_record(rec).unwrap();
         }
         let (s_data, _, s_blocks, _) = sw.finish().unwrap();
         std::fs::write(&s_path, &s_data).unwrap();
         // Batch write
-        let (_, b_blocks, _) = SstWriter::write(&b_path, &records, 10, 10).unwrap();
+        let (_, b_blocks, _) =
+            SstWriter::write(&b_path, &records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
 
         assert_eq!(s_blocks.len(), b_blocks.len());
 
@@ -862,7 +909,8 @@ mod tests {
     fn test_sst_reader_open_region() {
         // Verify SstReader::open_region works for a byte range within a larger buffer.
         let records = make_records(30);
-        let (data, _, block_infos, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+        let (data, _, block_infos, _) =
+            SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
 
         // Simulate a container file: header padding + SST data + trailing junk
         let padding = 128usize;
@@ -893,5 +941,79 @@ mod tests {
         assert_eq!(all.len(), 30);
         assert_eq!(all[0].key, b"key_0000");
         assert_eq!(all[29].key, b"key_0029");
+    }
+
+    #[test]
+    fn test_sst_roundtrip_none_compression() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("none.sst");
+        let records = make_records(50);
+        let (_, block_infos, _) =
+            SstWriter::write(&path, &records, 10, 10, CompressionAlgorithm::None).unwrap();
+        let reader = SstReader::open(&path, 1, block_infos.len()).unwrap();
+        let mut all = Vec::new();
+        for i in 0..reader.block_count() {
+            all.extend(reader.read_block(i, None).unwrap().records);
+        }
+        assert_eq!(all.len(), 50);
+        assert_eq!(all[0].key, b"key_0000");
+    }
+
+    #[test]
+    fn test_sst_roundtrip_zstd_compression() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("zstd.sst");
+        let records = make_records(50);
+        let (_, block_infos, _) =
+            SstWriter::write(&path, &records, 10, 10, CompressionAlgorithm::Zstd { level: 3 })
+                .unwrap();
+        let reader = SstReader::open(&path, 1, block_infos.len()).unwrap();
+        let mut all = Vec::new();
+        for i in 0..reader.block_count() {
+            all.extend(reader.read_block(i, None).unwrap().records);
+        }
+        assert_eq!(all.len(), 50);
+        assert_eq!(all[0].key, b"key_0000");
+    }
+
+    #[test]
+    fn test_sst_stream_writer_zstd_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stream_zstd.sst");
+        let records = make_records(25);
+        let mut writer =
+            SstStreamWriter::new(10, 25, 10, CompressionAlgorithm::Zstd { level: 1 }).unwrap();
+        for rec in &records {
+            writer.write_record(rec).unwrap();
+        }
+        let (data, _, blocks, _) = writer.finish().unwrap();
+        std::fs::write(&path, &data).unwrap();
+        let reader = SstReader::open(&path, 1, blocks.len()).unwrap();
+        let mut all = Vec::new();
+        for i in 0..reader.block_count() {
+            all.extend(reader.read_block(i, None).unwrap().records);
+        }
+        assert_eq!(all.len(), 25);
+        assert_eq!(all[0].key, b"key_0000");
+    }
+
+    #[test]
+    fn test_sst_stream_writer_none_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stream_none.sst");
+        let records = make_records(25);
+        let mut writer =
+            SstStreamWriter::new(10, 25, 10, CompressionAlgorithm::None).unwrap();
+        for rec in &records {
+            writer.write_record(rec).unwrap();
+        }
+        let (data, _, blocks, _) = writer.finish().unwrap();
+        std::fs::write(&path, &data).unwrap();
+        let reader = SstReader::open(&path, 1, blocks.len()).unwrap();
+        let mut all = Vec::new();
+        for i in 0..reader.block_count() {
+            all.extend(reader.read_block(i, None).unwrap().records);
+        }
+        assert_eq!(all.len(), 25);
     }
 }

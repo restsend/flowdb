@@ -5,13 +5,38 @@ use napi_derive::napi;
 use std::sync::Arc;
 
 use flowdb::jsondb::{JsonDB, TransactionMode};
-use flowdb::record::Config;
+use flowdb::record::{CompressionAlgorithm, Config};
 use serde_json::Value;
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn flow_err(e: impl ToString) -> napi::Error {
     napi::Error::from_reason(e.to_string())
+}
+
+fn parse_compression(s: &str) -> Result<CompressionAlgorithm> {
+    match s {
+        "none" => Ok(CompressionAlgorithm::None),
+        "lz4" => Ok(CompressionAlgorithm::Lz4),
+        _ => {
+            if let Some(rest) = s.strip_prefix("zstd:") {
+                let level: i32 = rest.parse().map_err(|_| {
+                    napi::Error::from_reason(format!("invalid zstd level: {}", rest))
+                })?;
+                if !(1..=22).contains(&level) {
+                    return Err(napi::Error::from_reason(
+                        "zstd level must be 1..=22",
+                    ));
+                }
+                Ok(CompressionAlgorithm::Zstd { level })
+            } else {
+                Err(napi::Error::from_reason(format!(
+                    "invalid compression '{}': expected 'none', 'lz4', or 'zstd:<level>'",
+                    s
+                )))
+            }
+        }
+    }
 }
 
 fn parse_mode(s: &str) -> Result<TransactionMode> {
@@ -100,6 +125,8 @@ pub struct JsConfig {
     pub block_cache_capacity_mb: Option<i64>,
     pub bloom_bits_per_key: Option<i64>,
     pub compaction_interval_ms: Option<i64>,
+    /// Compression algorithm: "none", "lz4", or "zstd:{level}" (e.g. "zstd:3")
+    pub compression: Option<String>,
 }
 
 // ── FlowDb ──────────────────────────────────────────────────────────
@@ -117,6 +144,7 @@ impl FlowDb {
     pub fn open(config: JsConfig) -> Result<FlowDb> {
         let mut cfg = Config {
             data_dir: config.data_dir.into(),
+            compression: flowdb::record::CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         if let Some(v) = config.create_if_missing {
@@ -141,6 +169,9 @@ impl FlowDb {
         if let Some(v) = config.compaction_interval_ms {
             if v <= 0 { return Err(napi::Error::from_reason("compaction_interval_ms must be > 0")); }
             cfg.compaction_interval_ms = v as u64;
+        }
+        if let Some(v) = config.compression {
+            cfg.compression = parse_compression(&v)?;
         }
         let db = JsonDB::open(cfg).map_err(flow_err)?;
         Ok(FlowDb {

@@ -127,6 +127,7 @@ impl Engine {
         let storage = self.storage.clone();
         let block_size = self.config.block_size;
         let bloom_bits = self.config.bloom_bits_per_key;
+        let compression = self.config.compression;
         let compaction_threshold = self.config.compaction_threshold;
         let flush_interval = self.config.flush_interval_ms.max(1);
         let gc_interval = self.config.gc_interval_secs.max(1);
@@ -180,6 +181,7 @@ impl Engine {
                             let compaction = crate::compaction::CompactionRunner::new(
                                 block_size,
                                 bloom_bits,
+                                compression,
                                 compaction_threshold,
                                 manifest.clone(),
                                 index.clone(),
@@ -987,6 +989,7 @@ impl Engine {
         let compaction = CompactionRunner::new(
             self.config.block_size,
             self.config.bloom_bits_per_key,
+            self.config.compression,
             self.config.compaction_threshold,
             self.manifest.clone(),
             self.index.clone(),
@@ -1720,6 +1723,7 @@ mod tests {
             wal_sync_mode: SyncMode::IntervalMs(u64::MAX),
             auto_background: false,
             storage_backend: crate::record::StorageBackendKind::MultiFile,
+            compression: crate::record::CompressionAlgorithm::Lz4,
         }
     }
 

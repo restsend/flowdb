@@ -25,6 +25,7 @@ fn main() {
         memtable_size_mb: 4,            // small memtable → fast flush
         flush_interval_ms: 500,
         auto_background: true,          // background flush / compact / GC
+        compression: flowdb::record::CompressionAlgorithm::Lz4,
         ..Config::default()
     })
     .unwrap();

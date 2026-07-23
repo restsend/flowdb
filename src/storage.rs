@@ -566,7 +566,8 @@ pub(crate) fn open_storage(
 mod tests {
     use super::*;
     use crate::record::{InternalRecord, Record};
-    use crate::sstable::SstWriter;
+    use crate::record::CompressionAlgorithm;
+use crate::sstable::SstWriter;
     use tempfile::TempDir;
 
     fn make_records(n: usize) -> Vec<InternalRecord> {
@@ -593,7 +594,8 @@ mod tests {
         let storage = MultiFileStorage::new(dir.path());
 
         let records = make_records(30);
-        let (data, _, blocks, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+        let (data, _, blocks, _) =
+            SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
 
         assert!(!storage.sst_exists(1));
         storage.write_sst(1, &data).unwrap();
@@ -627,12 +629,14 @@ mod tests {
 
         // Write SST #1 with 10 records
         let records1 = make_records(10);
-        let (data1, _, _, _) = SstWriter::write_to_buf(&records1, 10, 10).unwrap();
+        let (data1, _, _, _) =
+            SstWriter::write_to_buf(&records1, 10, 10, CompressionAlgorithm::Lz4).unwrap();
         storage.write_sst(1, &data1).unwrap();
 
         // Overwrite with different data (20 records)
         let records2 = make_records(20);
-        let (data2, _, blocks2, _) = SstWriter::write_to_buf(&records2, 10, 10).unwrap();
+        let (data2, _, blocks2, _) =
+            SstWriter::write_to_buf(&records2, 10, 10, CompressionAlgorithm::Lz4).unwrap();
         storage.write_sst(1, &data2).unwrap();
 
         let reader = storage.open_reader(1, blocks2.len()).unwrap();
@@ -673,7 +677,7 @@ mod tests {
         let storage = SingleFileStorage::open(&db_path).unwrap();
 
         let records = make_records(30);
-        let (data, _, blocks, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+        let (data, _, blocks, _) = SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
 
         assert!(!storage.sst_exists(1));
         storage.write_sst(1, &data).unwrap();
@@ -707,7 +711,7 @@ mod tests {
         let db_path = make_db_path(dir.path());
 
         let records = make_records(50);
-        let (data, _, blocks, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+        let (data, _, blocks, _) = SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
 
         {
             let storage = SingleFileStorage::open(&db_path).unwrap();
@@ -733,7 +737,7 @@ mod tests {
         let db_path = make_db_path(dir.path());
 
         let records = make_records(20);
-        let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+        let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
 
         {
             let storage = SingleFileStorage::open(&db_path).unwrap();
@@ -755,12 +759,14 @@ mod tests {
 
         // Write SST 1 with 10 records
         let r1 = make_records(10);
-        let (d1, _, _, _) = SstWriter::write_to_buf(&r1, 10, 10).unwrap();
+        let (d1, _, _, _) =
+            SstWriter::write_to_buf(&r1, 10, 10, CompressionAlgorithm::Lz4).unwrap();
         storage.write_sst(1, &d1).unwrap();
 
         // Overwrite SST 1 with 20 records
         let r2 = make_records(20);
-        let (d2, _, blocks2, _) = SstWriter::write_to_buf(&r2, 10, 10).unwrap();
+        let (d2, _, blocks2, _) =
+            SstWriter::write_to_buf(&r2, 10, 10, CompressionAlgorithm::Lz4).unwrap();
         storage.write_sst(1, &d2).unwrap();
 
         let reader = storage.open_reader(1, blocks2.len()).unwrap();
@@ -782,7 +788,7 @@ mod tests {
         // Write 5 SSTs, delete 3.
         for id in 1..=5u32 {
             let records = make_records(20);
-            let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+            let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
             storage.write_sst(id, &data).unwrap();
         }
         storage.delete_sst(1).unwrap();
@@ -837,7 +843,7 @@ mod tests {
             let storage = SingleFileStorage::open(&db_path).unwrap();
             for id in 1..=5u32 {
                 let records = make_records(20);
-                let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+                let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
                 storage.write_sst(id, &data).unwrap();
             }
             // Delete some.
@@ -866,7 +872,7 @@ mod tests {
         {
             let storage = SingleFileStorage::open(&db_path).unwrap();
             let records = make_records(20);
-            let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+            let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
             storage.write_sst(1, &data).unwrap();
         }
 
@@ -900,7 +906,7 @@ mod tests {
         // Write 100 SSTs
         for id in 1..=100u32 {
             let records = make_records(10);
-            let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10).unwrap();
+            let (data, _, _, _) = SstWriter::write_to_buf(&records, 10, 10, CompressionAlgorithm::Lz4).unwrap();
             storage.write_sst(id, &data).unwrap();
         }
 

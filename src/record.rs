@@ -209,6 +209,32 @@ pub enum StorageBackendKind {
     SingleFile,
 }
 
+/// Compression algorithm selection for SSTable blocks.
+///
+/// - `None`: no compression (raw data stored as-is)
+/// - `Lz4`: fast block compression using LZ4 (default, good for most workloads)
+/// - `Zstd { level }`: zstd compression with configurable level 1..=22
+///   (level 1 = fastest, 22 = densest, 3 = balanced default)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionAlgorithm {
+    /// No compression — fastest write, largest files.
+    None,
+    /// LZ4 block compression — fast, moderate ratio.
+    Lz4,
+    /// zstd compression with configurable level (1 = fastest, 22 = densest).
+    Zstd {
+        /// Compression level (1..=22). 3 is a good balanced default.
+        level: i32,
+    },
+}
+
+impl Default for CompressionAlgorithm {
+    fn default() -> Self {
+        Self::Lz4
+    }
+}
+
 /// ```no_run
 /// use flowdb::Config;
 ///
@@ -277,11 +303,18 @@ pub struct Config {
     /// manual control over maintenance operations.
     #[serde(default = "default_background")]
     pub auto_background: bool,
-    /// On-disk storage backend (default: `MultiFile`).
-    /// - `MultiFile`: one `.sst` file per SST under `{data_dir}/SST/`.
-    /// - `SingleFile`: all SSTs packed inside a single `{data_dir}/flow.db` file.
-    #[serde(default)]
-    pub storage_backend: StorageBackendKind,
+/// On-disk storage backend (default: `MultiFile`).
+/// - `MultiFile`: one `.sst` file per SST under `{data_dir}/SST/`.
+/// - `SingleFile`: all SSTs packed inside a single `{data_dir}/flow.db` file.
+#[serde(default)]
+pub storage_backend: StorageBackendKind,
+/// Compression algorithm and level (default: `Lz4`).
+/// - `None`: no compression (fastest, largest files)
+/// - `Lz4`: fast compression, moderate ratio
+/// - `Zstd { level }`: configurable ratio/speed trade-off
+///   (level 1 = fastest, 22 = densest, 3 = balanced default)
+#[serde(default)]
+pub compression: CompressionAlgorithm,
 }
 
 fn default_background() -> bool {
@@ -313,6 +346,7 @@ impl Default for Config {
             wal_sync_mode: SyncMode::Always,
             auto_background: true,
             storage_backend: StorageBackendKind::MultiFile,
+            compression: CompressionAlgorithm::default(),
         }
     }
 }
@@ -389,6 +423,16 @@ impl Config {
                 "time_bucket_secs is too large (product with 1_000_000 would overflow i64)"
                     .into(),
             ));
+        }
+        match self.compression {
+            CompressionAlgorithm::Zstd { level }
+                if !(1..=22).contains(&level) =>
+            {
+                return Err(FlowError::Config(
+                    "zstd compression level must be in 1..=22".into(),
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -824,6 +868,7 @@ mod tests {
     fn test_config_validate_ok() {
         let cfg = Config {
             data_dir: std::env::temp_dir().join("flowdb-validate-ok"),
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
@@ -833,6 +878,7 @@ mod tests {
     fn test_config_validate_time_bucket_zero() {
         let cfg = Config {
             time_bucket_secs: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(
@@ -845,6 +891,7 @@ mod tests {
     fn test_config_validate_memtable_zero() {
         let cfg = Config {
             memtable_size_mb: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -854,6 +901,7 @@ mod tests {
     fn test_config_validate_max_frozen_zero() {
         let cfg = Config {
             max_frozen_memtables: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -863,6 +911,7 @@ mod tests {
     fn test_config_validate_block_size_zero() {
         let cfg = Config {
             block_size: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -872,6 +921,7 @@ mod tests {
     fn test_config_validate_bloom_zero() {
         let cfg = Config {
             bloom_bits_per_key: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -881,6 +931,7 @@ mod tests {
     fn test_config_validate_wal_segment_zero() {
         let cfg = Config {
             wal_segment_size_mb: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -890,6 +941,7 @@ mod tests {
     fn test_config_validate_compaction_threshold_zero() {
         let cfg = Config {
             compaction_threshold: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -899,6 +951,7 @@ mod tests {
     fn test_config_validate_compaction_interval_zero() {
         let cfg = Config {
             compaction_interval_ms: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -908,6 +961,7 @@ mod tests {
     fn test_config_validate_cache_zero() {
         let cfg = Config {
             block_cache_capacity_mb: 0,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -917,6 +971,7 @@ mod tests {
     fn test_config_validate_ttl_zero() {
         let cfg = Config {
             default_ttl_secs: Some(0),
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -928,6 +983,7 @@ mod tests {
         // when converted to microseconds.
         let cfg = Config {
             default_ttl_secs: Some((i64::MAX as u64 / 1_000_000) + 1),
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
@@ -939,8 +995,72 @@ mod tests {
         let max_bucket = i64::MAX as u64 / 1_000_000;
         let cfg = Config {
             time_bucket_secs: max_bucket + 1,
+            compression: CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    // ── CompressionAlgorithm tests ────────────────────────────────
+
+    #[test]
+    fn test_compression_default_is_lz4() {
+        assert_eq!(CompressionAlgorithm::default(), CompressionAlgorithm::Lz4);
+    }
+
+    #[test]
+    fn test_config_compression_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.compression, CompressionAlgorithm::Lz4);
+    }
+
+    #[test]
+    fn test_validate_zstd_level_ok() {
+        for level in [1, 3, 22] {
+            let cfg = Config {
+                compression: CompressionAlgorithm::Zstd { level },
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_ok(), "level {} should be valid", level);
+        }
+    }
+
+    #[test]
+    fn test_validate_zstd_level_zero_rejected() {
+        let cfg = Config {
+            compression: CompressionAlgorithm::Zstd { level: 0 },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_zstd_level_23_rejected() {
+        let cfg = Config {
+            compression: CompressionAlgorithm::Zstd { level: 23 },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_compression_serde_lz4() {
+        let json = serde_json::to_string(&CompressionAlgorithm::Lz4).unwrap();
+        let val: CompressionAlgorithm = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, CompressionAlgorithm::Lz4);
+    }
+
+    #[test]
+    fn test_compression_serde_zstd() {
+        let json = serde_json::to_string(&CompressionAlgorithm::Zstd { level: 5 }).unwrap();
+        let val: CompressionAlgorithm = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, CompressionAlgorithm::Zstd { level: 5 });
+    }
+
+    #[test]
+    fn test_compression_serde_none() {
+        let json = serde_json::to_string(&CompressionAlgorithm::None).unwrap();
+        let val: CompressionAlgorithm = serde_json::from_str(&json).unwrap();
+        assert_eq!(val, CompressionAlgorithm::None);
     }
 }

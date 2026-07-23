@@ -73,7 +73,8 @@ pub use engine::{Engine, MaintenanceHandle, ScanIterator};
 pub use error::{FlowError, Result};
 pub use flowdb_derive::ObjectStore;
 pub use record::{
-    Config, KeyFilter, Op, Query, ReadOptions, Record, ScanRange, StorageBackendKind, SyncMode,
+    CompressionAlgorithm, Config, KeyFilter, Op, Query, ReadOptions, Record, ScanRange,
+    StorageBackendKind, SyncMode,
 };
 pub use stats::EngineStats;
 

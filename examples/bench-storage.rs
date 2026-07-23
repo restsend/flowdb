@@ -23,6 +23,7 @@ fn make_config(dir: &Path, backend: StorageBackendKind) -> Config {
         wal_sync_mode: flowdb::SyncMode::IntervalMs(u64::MAX),
         auto_background: false,
         storage_backend: backend,
+        compression: flowdb::record::CompressionAlgorithm::Lz4,
     }
 }
 

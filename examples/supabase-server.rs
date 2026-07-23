@@ -374,6 +374,7 @@ async fn main() {
     let db = JsonDB::open(Config {
         data_dir: db_path.clone(),
         auto_background: true,
+        compression: flowdb::record::CompressionAlgorithm::Lz4,
         ..Config::default()
     })
     .expect("failed to open JsonDB");

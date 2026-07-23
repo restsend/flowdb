@@ -147,6 +147,7 @@ impl WriteWorker {
             &all_records,
             self.config.block_size,
             self.config.bloom_bits_per_key,
+            self.config.compression,
         )?;
 
         self.storage.write_sst(sst_id, &data)?;

@@ -20,6 +20,7 @@ mod tests {
         let cfg = Config {
             data_dir: dir.path().to_path_buf(),
             auto_background: false,
+            compression: crate::record::CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         let db = JsonDB::open(cfg).unwrap();
@@ -545,6 +546,7 @@ mod tests {
             let cfg = Config {
                 data_dir: path.clone(),
                 auto_background: false,
+                compression: crate::record::CompressionAlgorithm::Lz4,
                 ..Default::default()
             };
             let db = JsonDB::open(cfg).unwrap();
@@ -561,6 +563,7 @@ mod tests {
             let cfg = Config {
                 data_dir: path,
                 auto_background: false,
+                compression: crate::record::CompressionAlgorithm::Lz4,
                 ..Default::default()
             };
             let db = JsonDB::open(cfg).unwrap();
@@ -1153,6 +1156,7 @@ mod tests {
             let cfg = Config {
                 data_dir: path.clone(),
                 auto_background: false,
+                compression: crate::record::CompressionAlgorithm::Lz4,
                 ..Default::default()
             };
             let db = JsonDB::open(cfg).unwrap();
@@ -1166,6 +1170,7 @@ mod tests {
             let cfg = Config {
                 data_dir: path,
                 auto_background: false,
+                compression: crate::record::CompressionAlgorithm::Lz4,
                 ..Default::default()
             };
             let db = JsonDB::open(cfg).unwrap();
@@ -1261,6 +1266,7 @@ mod tests {
         let cfg = Config {
             data_dir: dir.path().to_path_buf(),
             auto_background: false,
+            compression: crate::record::CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         let db = JsonDB::open(cfg).unwrap();
@@ -1421,6 +1427,7 @@ mod tests {
             let cfg = Config {
                 data_dir: path.clone(),
                 auto_background: false,
+                compression: crate::record::CompressionAlgorithm::Lz4,
                 ..Default::default()
             };
             let db = JsonDB::open(cfg).unwrap();
@@ -1435,6 +1442,7 @@ mod tests {
             let cfg = Config {
                 data_dir: path,
                 auto_background: false,
+                compression: crate::record::CompressionAlgorithm::Lz4,
                 ..Default::default()
             };
             let db = JsonDB::open(cfg).unwrap();
@@ -1460,6 +1468,7 @@ mod tests {
             let cfg = Config {
                 data_dir: path.clone(),
                 auto_background: false,
+                compression: crate::record::CompressionAlgorithm::Lz4,
                 ..Default::default()
             };
             let db = JsonDB::open(cfg).unwrap();
@@ -1477,6 +1486,7 @@ mod tests {
             let cfg = Config {
                 data_dir: path,
                 auto_background: false,
+                compression: crate::record::CompressionAlgorithm::Lz4,
                 ..Default::default()
             };
             let db = JsonDB::open(cfg).unwrap();
@@ -2504,6 +2514,7 @@ mod tests {
             auto_background: false,
             wal_sync_mode: crate::record::SyncMode::IntervalMs(u64::MAX),
             memtable_size_mb: 64,
+            compression: crate::record::CompressionAlgorithm::Lz4,
             ..Default::default()
         };
         let engine = crate::engine::Engine::open(cfg).unwrap();
@@ -2545,6 +2556,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             auto_background: false,
             wal_sync_mode: crate::record::SyncMode::Always,
+            compression: crate::record::CompressionAlgorithm::Lz4,
             ..Default::default()
         };
 
@@ -2572,6 +2584,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             auto_background: false,
             wal_sync_mode: crate::record::SyncMode::Always,
+            compression: crate::record::CompressionAlgorithm::Lz4,
             ..Default::default()
         };
 
