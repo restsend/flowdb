@@ -3,7 +3,7 @@ members = ["flowdb-derive", "bindings/node"]
 
 [package]
 name = "flowdb"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/flowdb"
