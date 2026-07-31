@@ -192,24 +192,44 @@ impl BlockMetaIndex {
     fn collect_by_key(&self, key_filter: &KeyFilter, now_us: i64) -> Vec<BlockMeta> {
         match key_filter {
             KeyFilter::Prefix(key) => {
+                let prefix_start = key.to_vec();
                 let prefix_end = increment_prefix(key.as_slice());
-                self.by_key
-                    .range(..prefix_end)
-                    .flat_map(|(_, metas)| metas.iter())
+                // Scan only the prefix's key range instead of from the index
+                // start: a query for a late call no longer pays for every
+                // earlier block. The single block immediately preceding `key`
+                // is also included in case a block spans the boundary.
+                let mut candidates: Vec<Arc<BlockMeta>> = self
+                    .by_key
+                    .range(prefix_start.clone()..prefix_end)
+                    .flat_map(|(_, metas)| metas.iter().cloned())
+                    .collect();
+                if let Some((_, prev)) = self.by_key.range(..prefix_start.clone()).next_back() {
+                    candidates.extend(prev.iter().cloned());
+                }
+                candidates
+                    .into_iter()
                     .filter(|m| !m.is_expired(now_us) && m.overlaps_key_prefix(key.as_slice()))
-                    .map(|m| (**m).clone())
+                    .map(|m| (*m).clone())
                     .collect()
             }
             KeyFilter::Range { start, end } => {
+                let start_vec = start.to_vec();
                 let end_key = increment_prefix(end.as_slice());
-                self.by_key
-                    .range(..end_key)
-                    .flat_map(|(_, metas)| metas.iter())
+                let mut candidates: Vec<Arc<BlockMeta>> = self
+                    .by_key
+                    .range(start_vec.clone()..end_key)
+                    .flat_map(|(_, metas)| metas.iter().cloned())
+                    .collect();
+                if let Some((_, prev)) = self.by_key.range(..start_vec.clone()).next_back() {
+                    candidates.extend(prev.iter().cloned());
+                }
+                candidates
+                    .into_iter()
                     .filter(|m| {
                         !m.is_expired(now_us)
                             && m.overlaps_key_range(start.as_slice(), end.as_slice())
                     })
-                    .map(|m| (**m).clone())
+                    .map(|m| (*m).clone())
                     .collect()
             }
             KeyFilter::All => self

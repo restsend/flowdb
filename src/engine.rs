@@ -890,20 +890,6 @@ impl Engine {
         Ok(reader)
     }
 
-    fn get_reader_from_map(
-        readers: &HashMap<u32, Arc<SstReader>>,
-        storage: &Arc<dyn StorageBackend>,
-        sst_id: u32,
-    ) -> Result<Arc<SstReader>> {
-        if let Some(reader) = readers.get(&sst_id) {
-            return Ok(reader.clone());
-        }
-        if !storage.sst_exists(sst_id) {
-            return Err(FlowError::Other(format!("sst {} not found", sst_id)));
-        }
-        Ok(Arc::new(storage.open_reader(sst_id, 0)?))
-    }
-
     /// Rebuild the persisted bloom filter for `sst_id` using the current
     /// hasher. Scans every block in the SST, collects unique keys, builds a
     /// fresh `BloomFilter`, persists it via a `ManifestEntry::UpdateBloom`,
@@ -1363,12 +1349,6 @@ impl ScanIterator {
             || matches!(&query.key_filter, KeyFilter::Prefix(p) if p.is_empty()))
             && query.time_range.is_none();
 
-        // 4) Snapshot SST readers
-        let readers_snapshot = {
-            let r = readers.read();
-            r.clone()
-        };
-
         // 5) Load + filter SST blocks into sources
         let mut sst_sources: Vec<std::iter::Peekable<std::vec::IntoIter<InternalRecord>>> =
             Vec::new();
@@ -1379,7 +1359,7 @@ impl ScanIterator {
         if is_full_scan {
             for meta in &candidates {
                 let reader =
-                    match Engine::get_reader_from_map(&readers_snapshot, storage, meta.sst_id) {
+                    match Engine::get_reader(readers, storage, meta.sst_id) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!(
@@ -1428,7 +1408,7 @@ impl ScanIterator {
         } else {
             for meta in &candidates {
                 let reader =
-                    match Engine::get_reader_from_map(&readers_snapshot, storage, meta.sst_id) {
+                    match Engine::get_reader(readers, storage, meta.sst_id) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::error!(
